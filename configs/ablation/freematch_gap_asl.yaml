@@ -1,0 +1,50 @@
+# =============================================================================
+# ABLATION: FreeMatch + ResNet-50 GAP (no label-correlation graph / no GCN head) + ASL.
+# Usage:  python train.py --c configs/ablation/freematch_resnet_gap_asl.yaml
+# =============================================================================
+data_dir: "/root/autodl-tmp/my_semi_learing/data/custom_muti"
+num_classes: 15
+labeled_ratio: 0.2
+split_mode: "by_prefix"
+
+backbone: "resnet101"
+variant: "gap"          # plain ResNet + global-average-pooling + Linear (no graph)
+pretrained: true
+
+loss: "asl"
+asl_gamma_neg: 4.0
+asl_gamma_pos: 1.0
+asl_clip: 0.05
+use_class_balancing: true
+
+T: 0.5
+hard_label: false
+ema_p: 0.999
+ema_m: 0.999
+use_ema_teacher: true
+use_quantile: true
+clip_thresh: true
+lambda_u: 1.0
+lambda_e: 0.005
+
+img_size: 224
+batch_size: 8
+uratio: 3
+eval_batch_size: 16
+num_workers: 4
+epochs: 120
+num_eval_iter: 500
+num_log_iter: 100
+amp: true
+
+optim: "SGD"
+lr: 0.005
+momentum: 0.9
+weight_decay: 5e-4
+clip_grad: 10.0
+layer_decay: 0.5
+
+patience: 15
+metric: "eval/mAP"
+save_name: "abl_freematch_gap_asl"
+seed: 42

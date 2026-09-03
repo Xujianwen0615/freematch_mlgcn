@@ -1,0 +1,54 @@
+﻿# =============================================================================
+# WEAK-SUPERVISED BASELINE:  Full-supervised ML-GCN + ASL, but trained only on
+# the 20% labeled subset (labeled_ratio=0.2).  The unlabeled data is NOT used
+# (lambda_u=0, lambda_e=0, no EMA teacher / no FreeMatch).
+#
+# This is the direct baseline to compare against the full semi-supervised method
+# D (FreeMatch + ML-GCN + ASL at the same labeled_ratio=0.2): any gap between
+# this run and D is the gain from semi-supervised learning.
+#
+# Usage:  python train.py --c configs/ablation/sup_partial_mlgcn_asl.yaml
+# =============================================================================
+data_dir: "/root/autodl-tmp/my_semi_learing/data/custom_muti"
+num_classes: 15
+labeled_ratio: 0.2
+split_mode: "by_prefix"
+
+backbone: "resnet101"
+variant: "gcn"
+pretrained: true
+gcn_t: 0.4
+
+loss: "asl"
+asl_gamma_neg: 4.0
+asl_gamma_pos: 1.0
+asl_clip: 0.05
+use_class_balancing: true
+
+# ---- NO semi-supervised signal: only supervised on the labeled subset ----
+lambda_u: 0.0
+lambda_e: 0.0
+use_ema_teacher: false
+
+img_size: 224
+batch_size: 8
+uratio: 3
+eval_batch_size: 16
+num_workers: 4
+epochs: 120
+num_eval_iter: 500
+num_log_iter: 100
+amp: true
+
+optim: "SGD"
+lr: 0.005
+momentum: 0.9
+weight_decay: 0.0005
+clip_grad: 10.0
+layer_decay: 0.5
+
+patience: 15
+metric: "eval/mAP"
+save_name: "abl_weak_sup_mlgcn_asl_020"
+seed: 42
+

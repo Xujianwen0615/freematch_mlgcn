@@ -1,0 +1,10 @@
+# Core training / evaluation stack for FreeMatch + ML-GCN + ASL (private multi-label).
+# Python 3.12 is recommended.
+torch>=2.0
+torchvision>=0.15
+numpy
+pillow
+scikit-learn
+scipy
+pyyaml
+pandas        # optional (used for CSV summaries)

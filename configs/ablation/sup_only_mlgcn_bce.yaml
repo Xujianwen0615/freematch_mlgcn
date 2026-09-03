@@ -1,0 +1,42 @@
+# =============================================================================
+# BASELINE A: Full-supervised ML-GCN with BCE loss  (no unlabeled, no FreeMatch).
+# Usage:  python train.py --c configs/ablation/sup_only_mlgcn_bce.yaml
+# =============================================================================
+data_dir: "/root/autodl-tmp/my_semi_learing/data/custom_muti"
+num_classes: 15
+labeled_ratio: 1.0
+split_mode: "by_prefix"
+
+backbone: "resnet101"
+variant: "gcn"
+pretrained: true
+gcn_t: 0.4
+
+loss: "bce"
+use_class_balancing: false
+
+lambda_u: 0.0
+lambda_e: 0.0
+use_ema_teacher: false
+
+img_size: 224
+batch_size: 8
+uratio: 3
+eval_batch_size: 16
+num_workers: 4
+epochs: 120
+num_eval_iter: 500
+num_log_iter: 100
+amp: true
+
+optim: "SGD"
+lr: 0.005
+momentum: 0.9
+weight_decay: 5e-4
+clip_grad: 10.0
+layer_decay: 0.5
+
+patience: 15
+metric: "eval/mAP"
+save_name: "abl_sup_only_mlgcn_bce"
+seed: 42
