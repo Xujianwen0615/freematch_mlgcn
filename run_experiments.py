@@ -10,7 +10,7 @@ Metrics are collected from the ``final.pth`` written by train.py and summarized 
 Usage
 -----
     # run everything, write a CSV summary
-    python run_experiments.py --base configs/freematch_mlgcn_resnet50.yaml --out_csv results_summary.csv
+    python run_experiments.py --base configs/freematch_mlgcn.yaml --out_csv results_summary.csv
 
     # only run a subset
     python run_experiments.py --only A,B,D
@@ -20,6 +20,7 @@ import argparse
 import gc
 import os
 import sys
+import time
 
 if sys.platform.startswith("win"):
     try:
@@ -56,7 +57,7 @@ def build_matrix():
         "loss": "bce", "use_class_balancing": False, "save_name": "C_ssl_mlgcn_bce",
     })
     M["D_ssl_mlgcn_asl"] = ("SSL FreeMatch+ML-GCN, ASL loss (full)    ", {
-        "loss": "asl", "save_name": "D_ssl_mlgcn_asl_resnet50",
+        "loss": "asl", "save_name": "D_ssl_mlgcn_asl",
     })
     M["E_ssl_gap_asl"] = ("Ablation: no graph (GAP) + ASL           ", {
         "variant": "gap", "save_name": "E_ssl_gap_asl",
@@ -84,7 +85,7 @@ def run_one(base_config, name, desc, overrides):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base", default="configs/freematch_mlgcn_resnet50.yaml")
+    parser.add_argument("--base", default="configs/freematch_mlgcn.yaml")
     parser.add_argument("--only", default="", help="comma-separated experiment names to run")
     parser.add_argument("--skip", default="", help="comma-separated experiment names to skip")
     parser.add_argument("--out_csv", default="", help="write a summary CSV")
