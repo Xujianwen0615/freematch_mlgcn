@@ -30,7 +30,7 @@ import torch.nn as nn
 from .metrics import compute_metrics
 
 
-def entropy_loss(mask, logits_s, prob_model, label_hist, fairness_weight=0.05):
+def entropy_loss(mask, logits_s, prob_model, label_hist, fairness_weight=0.15):
     """
     Multi-label entropy regularizer (FreeMatch) — confidence + fairness terms.
 
@@ -53,7 +53,8 @@ def entropy_loss(mask, logits_s, prob_model, label_hist, fairness_weight=0.05):
     prob_model = prob_model.reshape(-1).float()
     label_hist = label_hist.reshape(-1).float().clamp(min=1e-7)
 
-    class_weight = (1.0 / label_hist).clamp(max=5.0)   # capped so rare classes do not dominate
+    # class_weight = (1.0 / label_hist).clamp(max=5.0) 
+    class_weight = (1.0 / label_hist).clamp(max=20.0)   # capped so rare classes do not dominate
     class_weight = class_weight / (class_weight.sum() + 1e-7)
 
     hist_s_norm = hist_s / (hist_s.sum() + 1e-7)
@@ -72,9 +73,10 @@ class FreeMatchMultiLabel:
 
     def __init__(self, model, num_classes, criterion, consistency_criterion,
                  T=0.5, hard_label=False, ema_p=0.999, ema_m=0.999, use_ema_teacher=True,
-                 use_quantile=True, clip_thresh=True, time_p_init=0.5,
+                 use_quantile=True, clip_thresh=True, time_p_init=0.3,
                  lambda_u=1.0, lambda_e=0.005, use_class_balancing=True,
-                 asl_warmup_ratio=0.03, device="cuda", use_amp=False, logger=print):
+                 asl_warmup_ratio=0.03, label_counts=None, cb_beta=0.999,
+                 device="cuda", use_amp=False, logger=print):
         self.model = model
         self.ema_model = copy.deepcopy(model)
         self.num_classes = num_classes
@@ -91,6 +93,14 @@ class FreeMatchMultiLabel:
         self.lambda_u = lambda_u
         self.lambda_e = lambda_e
         self.use_class_balancing = use_class_balancing
+        self.cb_beta = cb_beta
+        # True per-class positive counts of the *labeled* pool (not the model-estimated
+        # ``label_hist``) — used for effective-number class balancing so that rare classes get a
+        # large, stable re-balancing weight instead of tracking the model's own long-tail bias.
+        if label_counts is not None:
+            self.label_counts = torch.as_tensor(label_counts, dtype=torch.float32, device=device)
+        else:
+            self.label_counts = torch.ones((num_classes,), dtype=torch.float32, device=device)
         self.asl_warmup_ratio = asl_warmup_ratio
         self.device = device
         self.use_amp = use_amp
@@ -112,8 +122,12 @@ class FreeMatchMultiLabel:
     def _per_class_threshold(self):
         """per_class_thresh[c] = time_p * (p_model[c] / max(p_model)), clamped."""
         mod = self.p_model / self.p_model.max()
-        mod = torch.clamp(mod, 0.25, 1.0)
-        thresh = torch.clamp(self.time_p * mod, 0.25, 0.90)
+        
+        # mod = torch.clamp(mod, 0.25, 1.0)
+        # thresh = torch.clamp(self.time_p * mod, 0.25, 0.90) 
+        # 改后（更低阈值 → 更多伪标签通过）
+        mod = torch.clamp(mod, 0.15, 1.0)
+        thresh = torch.clamp(self.time_p * mod, 0.15, 0.85)
         return thresh
 
     @torch.no_grad()
@@ -122,12 +136,13 @@ class FreeMatchMultiLabel:
         max_probs = probs_ulb.max(dim=-1)[0]
         if self.use_quantile:
             flat = probs_ulb.flatten().float()
-            q = torch.quantile(flat, 0.9)
+            q = torch.quantile(flat, 0.7)
         else:
-            q = torch.quantile(max_probs.float(), 0.9)
+            q = torch.quantile(max_probs.float(), 0.7)
         self.time_p = self.time_p * self.ema_p + (1 - self.ema_p) * q
         if self.clip_thresh:
-            self.time_p = torch.clamp(self.time_p, 0.6, 0.95)
+            # self.time_p = torch.clamp(self.time_p, 0.6, 0.95)
+            self.time_p = torch.clamp(self.time_p, 0.4, 0.90)
 
         self.p_model = self.p_model * self.ema_p + (1 - self.ema_p) * probs_ulb.float().mean(dim=0)
 
@@ -145,13 +160,28 @@ class FreeMatchMultiLabel:
                 tbp.copy_(bp)
 
     # ------------------------------------------------------------------ train
+    def _class_balancing_weight(self):
+        """Effective-number (class-balanced) per-class weight from the *labeled* class counts.
+
+        ``label_counts[c]`` = number of labeled images containing class c. Using the effective
+        number ``(1-beta)/(1-beta^{n_c})`` (Cui et al., CVPR 2019) gives rare classes a much larger
+        weight than the old linear ``1/n`` term capped at 5.0. Weights are mean-normalised and then
+        clamped (0.05..20) so no single class dominates a batch.
+        """
+        counts = self.label_counts.clamp(min=1.0)
+        beta = float(self.cb_beta)
+        beta_t = torch.tensor(beta, device=counts.device)
+        en = (1.0 - beta_t.pow(counts)) / (1.0 - beta + 1e-7)    # effective number E_n
+        w = 1.0 / en.clamp(min=1e-7)                             # class-balanced weight = 1 / E_n
+        w = w / (w.mean().clamp(min=1e-7))
+        return w.clamp(0.05, 20.0)
+
     def _sup_loss(self, logits_x_lb, y_lb):
-        """Supervised (ASL / BCE) loss with optional class re-balancing. Returns scalar."""
+        """Supervised (ASL / BCE) loss with effective-number (class-balanced) re-weighting."""
         per_elem = self.criterion(logits_x_lb, y_lb)  # [B, C]
         if self.use_class_balancing:
             with torch.no_grad():
-                class_weight = 1.0 / (self.label_hist.to(y_lb.device) * self.num_classes + 0.1)
-                class_weight = class_weight.clamp(0.5, 5.0)
+                class_weight = self._class_balancing_weight()
                 weight = torch.where(
                     y_lb > 0.5,
                     class_weight.unsqueeze(0),
@@ -220,7 +250,14 @@ class FreeMatchMultiLabel:
                 unsup_loss = (per_elem_unsup * mask.float()).sum() / mask.float().sum()
             else:
                 unsup_loss = torch.tensor(0.0, device=x_ulb_s.device)
-
+            
+            # conf = probs_x_ulb_w.clamp(min=0.0)                       # 弱视图置信度 [U, C]
+            # soft_w = (conf ** 2.0) * mask.float()                     # 置信度^2 加权 + 阈值掩码
+            # if soft_w.sum() > 0:
+            #     unsup_loss = (per_elem_unsup * soft_w).sum() / soft_w.sum()
+            # else:
+            #     unsup_loss = torch.tensor(0.0, device=x_ulb_s.device)
+                
             # ---- entropy regularizer ----
             if mask.sum() > 0:
                 ent_loss = entropy_loss(mask, logits_x_ulb_s, self.p_model, self.label_hist)
@@ -289,8 +326,8 @@ class FreeMatchMultiLabel:
 
 if __name__ == "__main__":
     # Smoke test with random data (no dataset needed).
-    from losses import build_loss
-    from models import build_model
+    from .losses import build_loss
+    from .models import build_model
     torch.manual_seed(0)
     model = build_model(15, backbone="resnet50", variant="gcn", pretrained=False,
                         adj_file=None, inp=None)

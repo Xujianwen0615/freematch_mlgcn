@@ -40,12 +40,14 @@ def get_args():
     p.add_argument("--checkpoint", type=str, required=True, help="saved checkpoint (.pth)")
     p.add_argument("--config", type=str, default="", help="config YAML (used if checkpoint lacks args)")
     p.add_argument("--phase", type=str, default="val", choices=["val", "test"])
-    p.add_argument("--data_dir", type=str, default=r"D:\CV\custom_muti")
+    p.add_argument("--data_dir", type=str, default=r"dataset/custom_muti")
     p.add_argument("--num_classes", type=int, default=15)
-    p.add_argument("--backbone", type=str, default="resnet50")
+    p.add_argument("--backbone", type=str, default="resnet101")
     p.add_argument("--variant", type=str, default="gcn")
     p.add_argument("--pretrained", type=str2bool, default=False)  # evaluate: don't re-download
     p.add_argument("--gcn_t", type=float, default=0.4)
+    p.add_argument("--embedding", type=str, default="glove", choices=["glove", "clip", "random"])
+    p.add_argument("--emb_model", type=str, default="openai/clip-vit-base-patch32")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--img_size", type=int, default=224)
@@ -69,7 +71,8 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     saved_args = ckpt.get("args", None)
     if saved_args:
-        for k in ("num_classes", "backbone", "variant", "gcn_t", "img_size", "data_dir"):
+        for k in ("num_classes", "backbone", "variant", "gcn_t", "img_size", "data_dir",
+                  "embedding", "emb_model"):
             if hasattr(saved_args, k) and getattr(saved_args, k) is not None:
                 setattr(args, k, getattr(saved_args, k))
 
@@ -88,8 +91,19 @@ def main():
                         num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
     class_names = [ds.idx2cat[i] for i in range(ds.num_classes)]
 
+    # Reproduce the same class-embedding source used at training time (GloVe default, or CLIP /
+    # random). This keeps the first GCN layer's weight shape consistent with the checkpoint.
+    if getattr(args, "embedding", "glove") == "clip":
+        from mlgcn.models import load_clip_class_embeddings
+        inp = load_clip_class_embeddings(class_names, model_name=args.emb_model)
+    elif getattr(args, "embedding", "glove") == "random":
+        inp = np.random.randn(ds.num_classes, 300).astype(np.float32)
+    else:
+        inp = ds.inp   # GloVe [C, 300]
+
     # Build model and load weights.
-    inp = ds.inp
+    # NOTE: the adjacency matrix (A/adj) is registered as a model buffer and restored from the
+    # checkpoint via load_state_dict, so the adjacency source below only needs matching shape.
     model = build_model(ds.num_classes, backbone=args.backbone, variant=args.variant,
                         pretrained=args.pretrained, t=args.gcn_t,
                         adj_file=os.path.join(args.data_dir, "custom_adj.pkl"),

@@ -23,7 +23,9 @@ Key design notes
     embedding fed into the GCN.
   * GMP (global max pooling) is used by default, matching the original ML-GCN paper.
 """
+import json
 import math
+import os
 import pickle
 
 import numpy as np
@@ -36,11 +38,41 @@ from torch.nn import Parameter
 # ---------------------------------------------------------------------------
 # Adjacency matrix construction (copied / lightly tuned from models_mlgcn.py)
 # ---------------------------------------------------------------------------
-def gen_A(num_classes, t, adj_file):
-    """Read ``{"P": [C, C]}``, binarise at threshold ``t`` and re-weight per ML-GCN."""
-    with open(adj_file, "rb") as f:
-        result = pickle.load(f)
-    P = result["P"]                                   # conditional probability matrix, values in [0, 1]
+# def gen_A(num_classes, t, adj_file):
+#     """Read ``{"P": [C, C]}``, binarise at threshold ``t`` and re-weight per ML-GCN."""
+#     with open(adj_file, "rb") as f:
+#         result = pickle.load(f)
+#     P = result["P"]                                   # conditional probability matrix, values in [0, 1]
+#     A = (P >= t).astype(np.float32)
+#     nums = np.sum(A, axis=1, dtype=np.float32).reshape(-1, 1)
+#     _adj = A
+#     _nums = nums
+
+#     # ML-GCN paper re-weighting: neighbour weight = p / degree, self loop = 1 - p
+#     p = 0.2
+#     for i in range(num_classes):
+#         if _nums[i] > 0:
+#             _adj[i] = _adj[i] * (p / _nums[i])
+#         _adj[i, i] = 1.0 - p
+#     return _adj
+def gen_A(num_classes, t, adj_source):
+    """Binarise a conditional-probability matrix P at threshold ``t`` and re-weight per ML-GCN.
+
+    ``adj_source`` may be any of:
+      * a path to a pickle ``{"P": [C, C]}``  (the original custom_adj.pkl style)
+      * a mapping / dict carrying the key "P"
+      * a numpy [C, C] conditional-probability matrix directly (e.g. from
+        :func:`label_cooccurrence_from_annotations`).
+    """
+    if isinstance(adj_source, (str, os.PathLike)):
+        with open(adj_source, "rb") as f:
+            result = pickle.load(f)
+        P = result["P"]
+    elif isinstance(adj_source, dict):
+        P = adj_source.get("P", adj_source)
+    else:
+        P = adj_source
+    P = np.asarray(P, dtype=np.float32)               # conditional probability matrix, values in [0, 1]
     A = (P >= t).astype(np.float32)
     nums = np.sum(A, axis=1, dtype=np.float32).reshape(-1, 1)
     _adj = A
@@ -54,6 +86,99 @@ def gen_A(num_classes, t, adj_file):
         _adj[i, i] = 1.0 - p
     return _adj
 
+def label_cooccurrence_from_annotations(anno_path, num_classes, smoothing=0.0, self_loop=True):
+    """Rebuild the label-correlation matrix ``P`` directly from a train annotation file.
+
+    ``anno_path`` points to a JSON list of ``{"file_name", "labels": [idx, ...]}`` (the same file
+    the data loader uses). The conditional probability is the ML-GCN convention:
+
+        P[i, j] = P(label j present | label i present) = co_count(i, j) / count(i)
+
+    where ``co_count(i, j)`` counts images containing **both** labels. The diagonal is 1.0
+    automatically (a label always co-occurs with itself). Optional additive ``smoothing`` avoids
+    the 0/0 on very rare classes. Returns a numpy ``[C, C]`` float32 matrix of P values.
+
+    This lets you avoid relying on a stale, pre-generated ``custom_adj.pkl``: the correlation
+    graph is always derived from the actual training annotations.
+    """
+    with open(anno_path, "r", encoding="utf-8") as f:
+        annos = json.load(f)
+
+    co = np.zeros((num_classes, num_classes), dtype=np.float64)
+    cnt = np.zeros((num_classes,), dtype=np.float64)
+    for item in annos:
+        labels = sorted({int(x) for x in item["labels"]})
+        if not labels:
+            continue
+        cnt[labels] += 1.0
+        for i in labels:
+            for j in labels:
+                co[i, j] += 1.0
+
+    P = np.zeros((num_classes, num_classes), dtype=np.float64)
+    for i in range(num_classes):
+        if cnt[i] > 0:
+            P[i] = (co[i] + smoothing) / (cnt[i] + smoothing)
+        else:
+            P[i] = smoothing / (smoothing + 1e-7) if smoothing > 0 else 0.0
+    if self_loop:
+        np.fill_diagonal(P, 1.0)
+    return P.astype(np.float32)
+
+
+def build_adjacency_from_annotations(anno_path, num_classes, t=0.4, **kw):
+    """One-shot: rebuild the binarised/re-weighted ML-GCN adjacency from train annotations.
+
+    Equivalent to :func:`gen_A` applied to :func:`label_cooccurrence_from_annotations`, i.e. it
+    returns the *re-weighted* adjacency matrix (before the symmetric normalisation in
+    ``GCNResnet``). Prefer passing ``label_cooccurrence_from_annotations(...)`` to ``build_model``
+    so the model performs the normalisation itself.
+    """
+    P = label_cooccurrence_from_annotations(anno_path, num_classes, **kw)
+    return gen_A(num_classes, t, P)
+
+
+def load_clip_class_embeddings(class_names, model_name="openai/clip-vit-base-patch32",
+                               device=None, batch_size=32, local_files_only=False):
+    """Encode ``class_names`` (list[str]) with a CLIP text encoder into ``[C, d]`` float32.
+
+    Uses HuggingFace ``transformers`` (``CLIPModel`` + ``CLIPProcessor``); the returned vector is
+    L2-normalised. The embedding dim ``d`` is taken from the model (e.g. 512 for ViT-B/32, 768 for
+    ViT-L/14) and is inferred by ``build_model``/``GCNResnet`` so it always matches the first GCN
+    layer.
+
+    .. note:: First use needs the CLIP weights.
+        * Online: ``local_files_only=False`` (default) downloads the model from the HF hub once.
+        * Offline / already downloaded: pass ``local_files_only=True`` (fails fast, no network),
+          after e.g. ``python -c "from transformers import CLIPModel; CLIPModel.from_pretrained('openai/clip-vit-base-patch32')"``.
+
+    If the model cannot be loaded (e.g. offline and not cached), a random ``[C, 512]`` embedding is
+    returned so training can still proceed — inspect the warning before trusting it.
+    """
+    try:
+        import os as _os
+        _os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "15")   # bound per-request timeout
+        import torch
+        from transformers import CLIPModel, CLIPProcessor
+        dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # model = CLIPModel.from_pretrained(model_name, local_files_only=local_files_only)
+        # processor = CLIPProcessor.from_pretrained(model_name, local_files_only=local_files_only)
+        model = CLIPModel.from_pretrained("/root/autodl-tmp/free_mlgcn/clip_model")
+        processor = CLIPProcessor.from_pretrained("/root/autodl-tmp/free_mlgcn/clip_model")
+        model.to(dev).eval()
+        texts = [f"a photo of {name}" for name in class_names]
+        embs = []
+        with torch.no_grad():
+            for i in range(0, len(texts), batch_size):
+                chunk = texts[i:i + batch_size]
+                inputs = processor(text=chunk, return_tensors="pt", padding=True).to(dev)
+                feats = model.get_text_features(**inputs)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                embs.append(feats.cpu().numpy())
+        return np.concatenate(embs, axis=0).astype(np.float32)
+    except Exception as e:
+        print(f"[models] WARNING: CLIP text embedding failed ({e}); falling back to random init.")
+        return np.random.randn(len(class_names), 512).astype(np.float32)
 
 def gen_adj(A):
     """Standard symmetric GCN normalisation: D^{-1/2} A D^{-1/2}."""
@@ -106,6 +231,8 @@ class GCNResnet(nn.Module):
         )
         self.num_classes = num_classes
         # ML-GCN paper uses global max pooling (GMP).
+        if inp is not None:
+            in_channel = inp.shape[1]
         self.pooling = nn.AdaptiveMaxPool2d(1) if pooling == "max" else nn.AdaptiveAvgPool2d(1)
 
         self.gc1 = GraphConvolution(in_channel, gcn_hidden)
@@ -244,6 +371,10 @@ def build_model(num_classes, backbone="resnet50", variant="gcn",
     feat_dim = prefix[backbone] if backbone in prefix else feature_dim
 
     model = _backbone(backbone, pretrained=pretrained)
+    
+    if inp is not None:
+        inp = np.asarray(inp, dtype=np.float32)
+        in_channel = inp.shape[1]
 
     if variant == "gcn":
         return GCNResnet(model, num_classes,
@@ -268,8 +399,8 @@ def load_class_embeddings(inp_file):
 if __name__ == "__main__":
     # Quick smoke test.
     import torch
-    adj_file = r"D:\CV\custom_muti\custom_adj.pkl"
-    inp_file = r"D:\CV\custom_muti\custom_glove_word2vec.pkl"
+    adj_file = r"/root/autodl-tmp/my_semi_learing/data/custom_muti/custom_adj.pkl"
+    inp_file = r"/root/autodl-tmp/my_semi_learing/data/custom_muti/custom_glove_word2vec.pkl"
     inp = load_class_embeddings(inp_file)
     m = build_model(num_classes=15, backbone="resnet50", variant="gcn",
                     pretrained=False, t=0.4, adj_file=adj_file, inp=inp)

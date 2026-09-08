@@ -8,3 +8,4 @@ scikit-learn
 scipy
 pyyaml
 pandas        # optional (used for CSV summaries)
+transformers  # optional (only needed for --embedding clip, i.e. CLIP class embeddings)
