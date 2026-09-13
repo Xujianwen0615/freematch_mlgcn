@@ -2,34 +2,50 @@
 # Main config: FreeMatch + ML-GCN + ASL, ResNet (4GB-friendly)
 # Usage:  python train.py --c configs/freematch_mlgcn.yaml
 # =============================================================================
-data_dir: "/root/autodl-tmp/my_semi_learing/data/custom_muti"
+data_dir: "dataset/custom_muti"
+# data_dir: "dataset/custom_muti_aug"
 num_classes: 15
 labeled_ratio: 0.2
 split_mode: "by_prefix"
 
 backbone: "resnet101"
 variant: "gcn"
-pretrained: true
+pretrained: True
 gcn_t: 0.4
 
 loss: "asl"
 asl_gamma_neg: 4.0
+# asl_gamma_neg: 2.0         # 保留 ASL 时可下调（→ 2.0）
 asl_gamma_pos: 1.0
 asl_clip: 0.05
-use_class_balancing: true
+# asl_clip: 0.1             # 保留 ASL 时可上调（→ 0.1）
+
 
 T: 0.5
-hard_label: false
+hard_label: False
 ema_p: 0.999
 ema_m: 0.999
-use_ema_teacher: true
-use_quantile: true
-clip_thresh: true
+use_ema_teacher: True
+use_quantile: True
+clip_thresh: True
 lambda_u: 1.0
-lambda_e: 0.005
+lambda_e: 0.02
 asl_warmup_ratio: 0.03
 
-img_size: 224
+# ---- P1: relaxed pseudo-label thresholds / consistency weighting / entropy fairness ----
+time_p_init: 0.3          # 初始自适应阈值（越低 → 越多伪标签通过）
+thresh_q: 0.75            # 阈值更新的分位数（原 0.9 → 0.7，放宽）
+thresh_mod_min: 0.15      # per-class 阈值调制的下限（原 0.25 → 0.15）
+thresh_lo: 0.15           # 阈值下界（原 0.25 → 0.15）
+thresh_hi: 0.85           # 阈值上界（原 0.90 → 0.85）
+clip_lo: 0.4              # time_p 的 EMA 裁剪下界（原 0.6 → 0.4）
+clip_hi: 0.90
+conf_pow: 2.0             # 无标签一致性损失的置信度软权重指数（0 = 退回二值掩码）
+unsup_class_balance: true # 伪标签的尾部感知重加权（补偿置信度加权对稀有类的抑制）
+fairness_weight: 0.15     # 熵正则公平项权重（原 0.05 → 0.15）
+fairness_class_weight_max: 20.0
+
+img_size: 448
 batch_size: 8
 uratio: 3
 eval_batch_size: 16
@@ -37,7 +53,7 @@ num_workers: 4
 epochs: 120
 num_eval_iter: 500
 num_log_iter: 100
-amp: true
+amp: True
 
 optim: "SGD"
 lr: 0.005
@@ -49,5 +65,15 @@ layer_decay: 0.5
 patience: 15
 metric: "eval/mAP"
 
+# embedding: "clip"
+# recompute_adj: True
+
+#P0_1 有效样本数权重
+use_class_balancing: True
+# P0-2 稀有类过采样
+# oversample: True
+# cb_beta: 0.999   # 调 beta（越大越偏向严重/失衡；默认 0.999，可试 0.99 / 0.9999）
+
+save_dir: "outputs"
 save_name: "freematch_mlgcn"
 seed: 42

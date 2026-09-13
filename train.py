@@ -15,7 +15,6 @@ Usage
 -----
     python train.py --c configs/freematch_mlgcn.yaml
     python train.py --c configs/freematch_mlgcn.yaml --save_name freematch_mlgcn_clip
-    python train.py --c configs/freematch_mlgcn_resnet50.yaml --overwrite "lr=0.003 batch_size=4"
 """
 import argparse
 import math
@@ -48,8 +47,10 @@ from mlgcn.metrics import format_report
 DEFAULT_MEAN = [0.2318, 0.2274, 0.2761]
 DEFAULT_STD = [0.2077, 0.2220, 0.2262]
 
-# DEFAULT_MEAN = [0.2913, 0.2877, 0.3352]
-# DEFAULT_STD = [0.2158, 0.2275, 0.2357]
+
+# DEFAULT_MEAN = [0.2913, 0.2876, 0.3352]
+# DEFAULT_STD = [0.2158, 0.2275, 0.2356]
+
 
 # --------------------------------------------------------------------------- args
 def add_argument(parser):
@@ -74,7 +75,7 @@ def add_argument(parser):
     parser.add_argument("--pretrained", type=str2bool, default=True)
     parser.add_argument("--gcn_t", type=float, default=0.4)
     parser.add_argument("--gcn_hidden", type=int, default=1024)
-    
+
     # label-correlation graph & class-embedding source (ML-GCN head)
     parser.add_argument("--embedding", type=str, default="glove",
                         choices=["glove", "clip", "random"],
@@ -97,6 +98,27 @@ def add_argument(parser):
     parser.add_argument("--cb_beta", type=float, default=0.999,
                         help="beta for effective-number class balancing (Cui et al., CVPR 2019)")
 
+    # ---- P1: pseudo-label thresholds / consistency weighting / entropy fairness ----
+    parser.add_argument("--time_p_init", type=float, default=0.3,
+                        help="initial adaptive pseudo-label threshold (lower => more pseudo-labels)")
+    parser.add_argument("--thresh_q", type=float, default=0.7,
+                        help="quantile of unlabeled probs used to update the threshold")
+    parser.add_argument("--thresh_mod_min", type=float, default=0.15,
+                        help="lower clamp of the per-class threshold modulation p_model/max")
+    parser.add_argument("--thresh_lo", type=float, default=0.15)
+    parser.add_argument("--thresh_hi", type=float, default=0.85)
+    parser.add_argument("--clip_lo", type=float, default=0.4,
+                        help="lower clamp applied to time_p when clip_thresh is on")
+    parser.add_argument("--clip_hi", type=float, default=0.90)
+    parser.add_argument("--conf_pow", type=float, default=2.0,
+                        help="confidence exponent for soft-weighting the unlabeled loss (0 = hard mask)")
+    parser.add_argument("--unsup_class_balance", type=str2bool, default=True,
+                        help="tail-aware re-weighting of pseudo-labels in the unlabeled loss")
+    parser.add_argument("--fairness_weight", type=float, default=0.15,
+                        help="weight of the fairness term in the entropy regularizer")
+    parser.add_argument("--fairness_class_weight_max", type=float, default=20.0,
+                        help="cap of inverse-frequency weighting inside the fairness term")
+
     # algorithm (FreeMatch)
     parser.add_argument("--algorithm", type=str, default="freematch_mlgcn")
     parser.add_argument("--T", type=float, default=0.5)
@@ -107,7 +129,7 @@ def add_argument(parser):
     parser.add_argument("--use_quantile", type=str2bool, default=True)
     parser.add_argument("--clip_thresh", type=str2bool, default=True)
     parser.add_argument("--lambda_u", type=float, default=1.0)
-    parser.add_argument("--lambda_e", type=float, default=0.005)
+    parser.add_argument("--lambda_e", type=float, default=0.02)
     parser.add_argument("--asl_warmup_ratio", type=float, default=0.03)
 
     # training
@@ -179,8 +201,8 @@ def get_args():
     """CLI entry: precedence is CLI > YAML/config > defaults."""
     parser = argparse.ArgumentParser(description="FreeMatch + ML-GCN multi-label semi-supervised training")
     add_argument(parser)
-    args = parser.parse_args()                       # defaults
-    args = _apply_config(args, args.c)                 # YAML config on top
+    args = parser.parse_args()  # defaults
+    args = _apply_config(args, args.c)  # YAML config on top
     # CLI overrides (space separated k=v)
     if args.overwrite:
         for kv in args.overwrite.split():
@@ -199,7 +221,7 @@ def get_args():
                             setattr(args, k, v)
                     except ValueError:
                         setattr(args, k, v)
-    args = parser.parse_args(namespace=args)           # CLI on top of everything
+    args = parser.parse_args(namespace=args)  # CLI on top of everything
     # resolve adj / inp defaults
     if args.adj_file is None:
         args.adj_file = os.path.join(args.data_dir, "custom_adj.pkl")
@@ -285,7 +307,6 @@ def build_loaders(args):
         for l in item["labels"]:
             label_counts[int(l)] += 1.0
     print(f"[data] labeled per-class counts: {list(label_counts.astype(int))}")
-
     # Optional class-balanced over-sampling (P0): draw rare-class images more often.
     if getattr(args, "oversample", False) and train_lb.num_classes > 0 and len(train_lb) > 0:
         w = _oversampling_sampler(train_lb, num_classes, beta=getattr(args, "cb_beta", 0.999))
@@ -297,8 +318,7 @@ def build_loaders(args):
         print(f"[data] class-balanced over-sampling enabled (effective-number, beta={args.cb_beta})")
 
     class_names = [train_lb.idx2cat[i] for i in range(train_lb.num_classes)]
-    # inp = train_lb.inp  # [C, d] GloVe embeddings or None
-    
+
     # Choose the class-embedding source for the GCN head (GloVe default, or CLIP / random).
     emb_kind = getattr(args, "embedding", "glove")
     if emb_kind == "clip":
@@ -326,25 +346,28 @@ def _oversampling_sampler(dataset, num_classes, beta=0.999):
     for it in dataset.img_list:
         for l in it["labels"]:
             counts[int(l)] += 1.0
-    en = (1.0 - beta ** np.maximum(counts, 1.0)) / (1.0 - beta + 1e-7)   # effective number E_n
-    inv = 1.0 / np.maximum(en, 1e-7)                                    # class-balanced weight = 1/E_n
+    en = (1.0 - beta ** np.maximum(counts, 1.0)) / (1.0 - beta + 1e-7)  # effective number E_n
+    inv = 1.0 / np.maximum(en, 1e-7)  # class-balanced weight = 1/E_n
     w = np.empty(len(dataset), dtype=np.float64)
     for i, it in enumerate(dataset.img_list):
         if it["labels"]:
-            w[i] = inv[list(it["labels"])].mean()   # mean over the image's labels
+            w[i] = inv[list(it["labels"])].mean()  # mean over the image's labels
         else:
             w[i] = 1.0
-    w = w / (w.sum() + 1e-7) * len(w)     # normalise so the sampler scale is ~1x
+    w = w / (w.sum() + 1e-7) * len(w)  # normalise so the sampler scale is ~1x
     return w
 
 
 _FEAT = {"resnet18": 512, "resnet34": 512, "resnet50": 2048, "resnet101": 2048}
-def build_model_from_args(args, inp, num_classes,adj_source=None):
+
+
+def build_model_from_args(args, inp, num_classes, adj_source=None):
     if adj_source is None:
         adj_source = args.adj_file
     return build_model(num_classes, backbone=args.backbone, variant=args.variant,
                        pretrained=args.pretrained, t=args.gcn_t, adj_file=adj_source,
                        inp=inp, gcn_hidden=args.gcn_hidden, feature_dim=_FEAT.get(args.backbone, 2048))
+
 
 def _resolve_adj_source(args, save_path=None):
     """Return the label-correlation adjacency source."""
@@ -362,6 +385,7 @@ def _resolve_adj_source(args, save_path=None):
             print(f"[train] saved rebuilt adjacency to {out}")
         return P
     return getattr(args, "adj_file", None)
+
 
 def build_optimizer(args, model):
     weight_decay = float(args.weight_decay)  # 强制转换
@@ -403,11 +427,12 @@ def train(args):
 
     # -------------------- 日志重定向开始 --------------------
     log_path = os.path.join(save_path, "train.log")
-    log_file = open(log_path, "a", encoding="utf-8")
+    log_file = open(log_path, "w", encoding="utf-8")
     original_stdout = sys.stdout
 
     class Tee:
         """将输出同时发送到终端和文件"""
+
         def __init__(self, *files):
             self.files = files
 
@@ -435,13 +460,13 @@ def train(args):
 
         # # --- model ---
         # model = build_model_from_args(args, inp, args.num_classes).to(device)
-        
+
         # --- model ---
         # Rebuild the label-correlation adjacency from train annotations when requested
         # (instead of a stale custom_adj.pkl), then build the model with the chosen embeddings.
         adj_source = _resolve_adj_source(args, save_path)
         model = build_model_from_args(args, inp, args.num_classes, adj_source=adj_source).to(device)
-        
+
         print(f"[train] model={args.variant}/{args.backbone}, params={sum(p.numel() for p in model.parameters()):,}")
 
         # --- losses ---
@@ -457,10 +482,18 @@ def train(args):
             clip_thresh=args.clip_thresh, lambda_u=args.lambda_u, lambda_e=args.lambda_e,
             use_class_balancing=args.use_class_balancing, asl_warmup_ratio=args.asl_warmup_ratio,
             label_counts=label_counts, cb_beta=args.cb_beta,
+            time_p_init=args.time_p_init,
+            thresh_q=args.thresh_q, thresh_mod_min=args.thresh_mod_min,
+            thresh_lo=args.thresh_lo, thresh_hi=args.thresh_hi,
+            clip_lo=args.clip_lo, clip_hi=args.clip_hi,
+            conf_pow=args.conf_pow, unsup_class_balance=args.unsup_class_balance,
+            fairness_weight=args.fairness_weight,
+            fairness_class_weight_max=args.fairness_class_weight_max,
             device=device, use_amp=(args.amp and torch.cuda.is_available()), logger=print,
         )
         algo.class_names = class_names
         algo.num_train_iter = args.num_train_iter or (args.epochs * len(lb_loader))
+        print(f"[train] thresh_q={algo.thresh_q}")
 
         # --- optimizer / scheduler ---
         opt, sched = build_optimizer(args, model)
@@ -579,6 +612,7 @@ def train(args):
         sys.stdout = original_stdout
         log_file.close()
         print(f"[train] 完整日志已保存至 {log_path}")  # 此时 stdout 已恢复，只输出到终端
+
 
 def main():
     args = get_args()

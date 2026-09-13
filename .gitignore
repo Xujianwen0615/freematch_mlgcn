@@ -53,6 +53,7 @@ Thumbs.db
 # ============================================================
 # Large trained artifacts / checkpoints (never commit)
 # ============================================================
+dataset/
 outputs/
 result_model/
 *.pth

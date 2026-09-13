@@ -10,10 +10,13 @@ Metrics are collected from the ``final.pth`` written by train.py and summarized 
 Usage
 -----
     # run everything, write a CSV summary
-    python run_experiments.py --base configs/freematch_mlgcn.yaml --out_csv results_summary.csv
+    python run_experiments.py --out_csv results_summary.csv
+    python run_experiments.py --out_csv aug_results_summary.csv
 
     # only run a subset
-    python run_experiments.py --only A,B,D
+    python run_experiments.py --only C_ssl_mlgcn_bce,D_ssl_mlgcn --out_csv results_bce_asl_summary.csv
+    python run_experiments.py --only C_ssl_mlgcn_bce,C_ssl_mlgcn_bce_oversample --out_csv results_bce_oversample_summary.csv
+    python run_experiments.py --only C_ssl_mlgcn,C_ssl_mlgcn_q75,C_ssl_mlgcn_q8,C_ssl_mlgcn_q9 --out_csv results_thresh_summary.csv
     python run_experiments.py --dry
 """
 import argparse
@@ -46,18 +49,32 @@ def build_matrix():
         "save_name": "A_sup_mlgcn_bce",
     })
     M["B_sup_mlgcn_asl"] = ("Sup-only ML-GCN + ASL                    ", {
-        "labeled_ratio": 1.0, "loss": "asl", "lambda_u": 0.0, "lambda_e": 0.0,
+        "epochs": 23, "labeled_ratio": 1.0, "loss": "asl", "lambda_u": 0.0, "lambda_e": 0.0,
         "use_ema_teacher": False, "save_name": "B_sup_mlgcn_asl",
     })
     M["H_weak_sup_asl"] = ("Weak-sup ML-GCN+ASL, only 20% labels     ", {
         "labeled_ratio": 0.2, "loss": "asl", "lambda_u": 0.0, "lambda_e": 0.0,
         "use_ema_teacher": False, "save_name": "H_weak_sup_mlgcn_asl_020",
     })
-    M["C_ssl_mlgcn_bce"] = ("SSL FreeMatch+ML-GCN, BCE loss           ", {
-        "loss": "bce", "use_class_balancing": False, "save_name": "C_ssl_mlgcn_bce",
+
+    M["C_ssl_mlgcn"] = ("SSL FreeMatch+ML-GCN, BCE loss           ", {
+        "loss": "bce", "save_name": "C_ssl_mlgcn",
+        "oversample": True
     })
-    M["D_ssl_mlgcn_asl"] = ("SSL FreeMatch+ML-GCN, ASL loss (full)    ", {
-        "loss": "asl", "save_name": "D_ssl_mlgcn_asl",
+    M["C_ssl_mlgcn_q75"] = ("SSL FreeMatch+ML-GCN, BCE loss           ", {
+        "loss": "bce", "save_name": "C_ssl_mlgcn_q75",
+        "oversample": True, "thresh_q": 0.75
+    })
+    M["C_ssl_mlgcn_q8"] = ("SSL FreeMatch+ML-GCN, BCE loss           ", {
+        "loss": "bce", "save_name": "C_ssl_mlgcn_q8",
+        "oversample": True, "thresh_q": 0.80
+    })
+    M["C_ssl_mlgcn_q9"] = ("SSL FreeMatch+ML-GCN, BCE loss           ", {
+        "loss": "bce", "save_name": "C_ssl_mlgcn_q9",
+        "oversample": True, "thresh_q": 0.90
+    })
+    M["D_ssl_mlgcn"] = ("SSL FreeMatch+ML-GCN, ASL loss (full)    ", {
+        "save_name": "D_ssl_mlgcn",
     })
     M["E_ssl_gap_asl"] = ("Ablation: no graph (GAP) + ASL           ", {
         "variant": "gap", "save_name": "E_ssl_gap_asl",
@@ -67,9 +84,9 @@ def build_matrix():
     })
     # SSL label-ratio sweep (full method)
     for ratio in (0.05, 0.1, 0.2, 0.5):
-        key = f"G_ratio_{int(ratio*100):02d}"
+        key = f"G_ratio_{int(ratio * 100):02d}"
         M[key] = (f"Full method, labeled_ratio={ratio}              ", {
-            "labeled_ratio": ratio, "save_name": f"G_ratio_{int(ratio*100):02d}",
+            "labeled_ratio": ratio, "save_name": f"G_ratio_{int(ratio * 100):02d}",
         })
     return M
 

@@ -30,7 +30,8 @@ import torch.nn as nn
 from .metrics import compute_metrics
 
 
-def entropy_loss(mask, logits_s, prob_model, label_hist, fairness_weight=0.15):
+def entropy_loss(mask, logits_s, prob_model, label_hist, fairness_weight=0.15,
+                 class_weight_max=20.0, loss_clamp=10.0):
     """
     Multi-label entropy regularizer (FreeMatch) — confidence + fairness terms.
 
@@ -53,8 +54,7 @@ def entropy_loss(mask, logits_s, prob_model, label_hist, fairness_weight=0.15):
     prob_model = prob_model.reshape(-1).float()
     label_hist = label_hist.reshape(-1).float().clamp(min=1e-7)
 
-    # class_weight = (1.0 / label_hist).clamp(max=5.0) 
-    class_weight = (1.0 / label_hist).clamp(max=20.0)   # capped so rare classes do not dominate
+    class_weight = (1.0 / label_hist).clamp(max=class_weight_max)  # capped so rare classes do not dominate
     class_weight = class_weight / (class_weight.sum() + 1e-7)
 
     hist_s_norm = hist_s / (hist_s.sum() + 1e-7)
@@ -65,7 +65,7 @@ def entropy_loss(mask, logits_s, prob_model, label_hist, fairness_weight=0.15):
     fairness_loss = -(class_weight * prob_model_norm * torch.log(hist_s_norm)).sum()
 
     loss = confidence_loss + fairness_weight * fairness_loss
-    return torch.clamp(loss, 0.0, 10.0)
+    return torch.clamp(loss, 0.0, loss_clamp)
 
 
 class FreeMatchMultiLabel:
@@ -74,8 +74,12 @@ class FreeMatchMultiLabel:
     def __init__(self, model, num_classes, criterion, consistency_criterion,
                  T=0.5, hard_label=False, ema_p=0.999, ema_m=0.999, use_ema_teacher=True,
                  use_quantile=True, clip_thresh=True, time_p_init=0.3,
-                 lambda_u=1.0, lambda_e=0.005, use_class_balancing=True,
+                 lambda_u=1.0, lambda_e=0.02, use_class_balancing=True,
                  asl_warmup_ratio=0.03, label_counts=None, cb_beta=0.999,
+                 thresh_q=0.7, thresh_mod_min=0.15, thresh_lo=0.15, thresh_hi=0.85,
+                 clip_lo=0.4, clip_hi=0.90,
+                 conf_pow=2.0, unsup_class_balance=True,
+                 fairness_weight=0.15, fairness_class_weight_max=20.0,
                  device="cuda", use_amp=False, logger=print):
         self.model = model
         self.ema_model = copy.deepcopy(model)
@@ -85,11 +89,26 @@ class FreeMatchMultiLabel:
 
         self.T = T
         self.use_hard_label = hard_label
-        self.ema_p = ema_p              # threshold EMA momentum
-        self.ema_m = ema_m              # weight EMA momentum
+        self.ema_p = ema_p  # threshold EMA momentum
+        self.ema_m = ema_m  # weight EMA momentum
         self.use_ema_teacher = use_ema_teacher
         self.use_quantile = use_quantile
         self.clip_thresh = clip_thresh
+
+        # ---- P1-1: relaxed / configurable pseudo-label thresholds ----
+        self.thresh_q = thresh_q  # quantile of unlabeled probs used to update time_p
+        self.thresh_mod_min = thresh_mod_min
+        self.thresh_lo = thresh_lo
+        self.thresh_hi = thresh_hi
+        self.clip_lo = clip_lo  # clamp bounds applied to time_p when clip_thresh=True
+        self.clip_hi = clip_hi
+        # ---- P1-2: confidence-soft-weighted unsupervised consistency loss ----
+        self.conf_pow = conf_pow  # 0 => plain binary mask (old behaviour)
+        self.unsup_class_balance = unsup_class_balance  # tail-aware re-weighting of pseudo-labels
+        # ---- P1-3: strengthened entropy fairness term ----
+        self.fairness_weight = fairness_weight
+        self.fairness_class_weight_max = fairness_class_weight_max
+
         self.lambda_u = lambda_u
         self.lambda_e = lambda_e
         self.use_class_balancing = use_class_balancing
@@ -122,12 +141,10 @@ class FreeMatchMultiLabel:
     def _per_class_threshold(self):
         """per_class_thresh[c] = time_p * (p_model[c] / max(p_model)), clamped."""
         mod = self.p_model / self.p_model.max()
-        
-        # mod = torch.clamp(mod, 0.25, 1.0)
-        # thresh = torch.clamp(self.time_p * mod, 0.25, 0.90) 
+
         # 改后（更低阈值 → 更多伪标签通过）
-        mod = torch.clamp(mod, 0.15, 1.0)
-        thresh = torch.clamp(self.time_p * mod, 0.15, 0.85)
+        mod = torch.clamp(mod, self.thresh_mod_min, 1.0)  # 0.25 → 0.15
+        thresh = torch.clamp(self.time_p * mod, self.thresh_lo, self.thresh_hi)  # 0.25/0.90 → 0.15/0.85
         return thresh
 
     @torch.no_grad()
@@ -136,13 +153,12 @@ class FreeMatchMultiLabel:
         max_probs = probs_ulb.max(dim=-1)[0]
         if self.use_quantile:
             flat = probs_ulb.flatten().float()
-            q = torch.quantile(flat, 0.7)
+            q = torch.quantile(flat, self.thresh_q)
         else:
-            q = torch.quantile(max_probs.float(), 0.7)
+            q = torch.quantile(max_probs.float(), self.thresh_q)
         self.time_p = self.time_p * self.ema_p + (1 - self.ema_p) * q
         if self.clip_thresh:
-            # self.time_p = torch.clamp(self.time_p, 0.6, 0.95)
-            self.time_p = torch.clamp(self.time_p, 0.4, 0.90)
+            self.time_p = torch.clamp(self.time_p, self.clip_lo, self.clip_hi)
 
         self.p_model = self.p_model * self.ema_p + (1 - self.ema_p) * probs_ulb.float().mean(dim=0)
 
@@ -171,8 +187,8 @@ class FreeMatchMultiLabel:
         counts = self.label_counts.clamp(min=1.0)
         beta = float(self.cb_beta)
         beta_t = torch.tensor(beta, device=counts.device)
-        en = (1.0 - beta_t.pow(counts)) / (1.0 - beta + 1e-7)    # effective number E_n
-        w = 1.0 / en.clamp(min=1e-7)                             # class-balanced weight = 1 / E_n
+        en = (1.0 - beta_t.pow(counts)) / (1.0 - beta + 1e-7)  # effective number E_n
+        w = 1.0 / en.clamp(min=1e-7)  # class-balanced weight = 1 / E_n
         w = w / (w.mean().clamp(min=1e-7))
         return w.clamp(0.05, 20.0)
 
@@ -190,6 +206,29 @@ class FreeMatchMultiLabel:
                 normalizer = weight.sum().clamp(min=1.0)
             return (per_elem * weight).sum() / normalizer
         return per_elem.mean()
+
+    #     def _sup_loss(self, logits_x_lb, y_lb):
+    #         """Supervised (ASL / BCE) loss with optional class re-balancing. Returns scalar."""
+    #         per_elem = self.criterion(logits_x_lb, y_lb)  # [B, C]
+    #         if self.use_class_balancing:
+    #             with torch.no_grad():
+    #                 class_weight = 1.0 / (self.label_hist.to(y_lb.device) * self.num_classes + 0.1)
+    #                 class_weight = class_weight.clamp(0.5, 5.0)
+
+    #                 # # B) Effective-number (class-balanced) reweighting，β 可调（图省事就用 A）
+    #                 # beta = 0.999
+    #                 # n_c = self.label_hist.to(y_lb.device) * self.num_classes          # 各类有效计数
+    #                 # class_weight = (1.0 - beta) / (1.0 - pow(beta, n_c) + 1e-7)
+    #                 # class_weight = class_weight / class_weight.sum() * self.num_classes  # 归一化回均值
+
+    #                 weight = torch.where(
+    #                     y_lb > 0.5,
+    #                     class_weight.unsqueeze(0),
+    #                     torch.tensor(1.0, device=y_lb.device),
+    #                 )
+    #                 normalizer = weight.sum().clamp(min=1.0)
+    #             return (per_elem * weight).sum() / normalizer
+    #         return per_elem.mean()
 
     def sup_train_step(self, x_lb, y_lb):
         """Supervised-only step (used for full-supervision baselines / no-unlabeled runs)."""
@@ -236,8 +275,8 @@ class FreeMatchMultiLabel:
                 probs_x_ulb_w = torch.sigmoid(logits_x_ulb_w)
                 self._update_threshold(probs_x_ulb_w)
 
-                thresh = self._per_class_threshold()                       # [C]
-                mask = probs_x_ulb_w > thresh.unsqueeze(0)                 # [U, C] bool
+                thresh = self._per_class_threshold()  # [C]
+                mask = probs_x_ulb_w > thresh.unsqueeze(0)  # [U, C] bool
                 if self.use_hard_label:
                     pseudo_label = (probs_x_ulb_w > thresh.unsqueeze(0)).float()
                 else:
@@ -246,21 +285,32 @@ class FreeMatchMultiLabel:
 
             # ---- unsupervised consistency loss (masked) ----
             per_elem_unsup = self.consistency_criterion(logits_x_ulb_s, pseudo_label)  # [U, C]
-            if mask.sum() > 0:
-                unsup_loss = (per_elem_unsup * mask.float()).sum() / mask.float().sum()
-            else:
-                unsup_loss = torch.tensor(0.0, device=x_ulb_s.device)
-            
-            # conf = probs_x_ulb_w.clamp(min=0.0)                       # 弱视图置信度 [U, C]
-            # soft_w = (conf ** 2.0) * mask.float()                     # 置信度^2 加权 + 阈值掩码
-            # if soft_w.sum() > 0:
-            #     unsup_loss = (per_elem_unsup * soft_w).sum() / soft_w.sum()
+
+            # 无标签一致性用置信度软权重
+            # if mask.sum() > 0:
+            #     unsup_loss = (per_elem_unsup * mask.float()).sum() / mask.float().sum()
             # else:
             #     unsup_loss = torch.tensor(0.0, device=x_ulb_s.device)
-                
+
+            if mask.sum() > 0:
+                # P1-2: keep only above-threshold entries, then weight them softly.
+                w_u = mask.float()
+                if self.conf_pow > 0:
+                    # Down-weight low-confidence pseudo-labels (they are the noisy ones).
+                    w_u = w_u * probs_x_ulb_w.float().pow(self.conf_pow)
+                if self.unsup_class_balance:
+                    # Confidence weighting alone would further suppress rare classes (they are
+                    # less confident), so compensate with the effective-number class weights.
+                    w_u = w_u * self._class_balancing_weight().unsqueeze(0)
+                unsup_loss = (per_elem_unsup * w_u).sum() / w_u.sum().clamp(min=1e-7)
+            else:
+                unsup_loss = torch.tensor(0.0, device=x_ulb_s.device)
+
             # ---- entropy regularizer ----
             if mask.sum() > 0:
-                ent_loss = entropy_loss(mask, logits_x_ulb_s, self.p_model, self.label_hist)
+                ent_loss = entropy_loss(mask, logits_x_ulb_s, self.p_model, self.label_hist,
+                                        fairness_weight=self.fairness_weight,
+                                        class_weight_max=self.fairness_class_weight_max)
                 if torch.isnan(ent_loss):
                     ent_loss = torch.tensor(0.0, device=x_ulb_s.device)
             else:
@@ -328,6 +378,7 @@ if __name__ == "__main__":
     # Smoke test with random data (no dataset needed).
     from .losses import build_loss
     from .models import build_model
+
     torch.manual_seed(0)
     model = build_model(15, backbone="resnet50", variant="gcn", pretrained=False,
                         adj_file=None, inp=None)
