@@ -117,18 +117,22 @@ class MultiLabelDataset(Dataset):
         if not os.path.exists(img_path):
             raise FileNotFoundError(f"image not found: {img_path}")
 
+        # img.mode  'RGB'
+        # img.size  (W, H)  注意：PIL 是宽在前，高在后
         img = Image.open(img_path).convert("RGB")
 
         # Unlabeled: return weak + strong views.
         if self.phase == "train" and self.is_unlabeled:
             weak = self.weak_transform(img) if self.weak_transform is not None else img
             strong = self.strong_transform(img) if self.strong_transform is not None else img
+            # Tensor[3, H, W]   Tensor[3, H, W]
             return weak, strong
 
         # Labeled / val: return image + binarized {0,1} target.
         img = self.weak_transform(img) if self.weak_transform is not None else img
         target = np.zeros(self.num_classes, np.float32)
         target[item["labels"]] = 1.0
+        # Tensor[3, H, W]   numpy[C]
         return img, target
 
 
@@ -137,8 +141,7 @@ def collate_fn(batch):
     if len(batch) == 0:
         raise ValueError("empty batch")
     first = batch[0]
-    if isinstance(first, (tuple, list)) and len(first) == 2 and isinstance(first[1], torch.Tensor) \
-            and first[1].ndim == 3:
+    if isinstance(first, (tuple, list)) and len(first) == 2 and isinstance(first[1], torch.Tensor) and first[1].ndim == 3:
         # Unlabeled: (weak_img, strong_img)
         weak = torch.stack([b[0] for b in batch])
         strong = torch.stack([b[1] for b in batch])
@@ -153,12 +156,13 @@ if __name__ == "__main__":
     from torchvision import transforms
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--data_dir", default=r"D:\CV\custom_muti")
-    p.add_argument("--img_size", type=int, default=224)
+    p.add_argument("--data_dir", default=r"dataset/custom_muti")
+    p.add_argument("--img_size", type=int, default=448)
     p.add_argument("--ratio", type=float, default=0.2)
-    p.add_argument("--inp", default=r"D:\CV\custom_muti\custom_glove_word2vec.pkl")
+    p.add_argument("--inp", default=r"dataset/custom_muti/custom_glove_word2vec.pkl")
     a = p.parse_args()
 
+    # transforms.Resize的参数顺序是(height, width)
     tf = transforms.Compose([transforms.Resize((a.img_size, a.img_size)),
                              transforms.ToTensor(),
                              transforms.Normalize([0.2318, 0.2274, 0.2761],

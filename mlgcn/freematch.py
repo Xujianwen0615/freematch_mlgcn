@@ -71,7 +71,7 @@ def entropy_loss(mask, logits_s, prob_model, label_hist, fairness_weight=0.15,
 class FreeMatchMultiLabel:
     """Self-contained FreeMatch + multi-label trainer (student + EMA teacher)."""
 
-    def __init__(self, model, num_classes, criterion, consistency_criterion,
+    def __init__(self, model, num_classes, criterion, consistency_criterion, loss_type="asl",
                  T=0.5, hard_label=False, ema_p=0.999, ema_m=0.999, use_ema_teacher=True,
                  use_quantile=True, clip_thresh=True, time_p_init=0.3,
                  lambda_u=1.0, lambda_e=0.02, use_class_balancing=True,
@@ -86,6 +86,15 @@ class FreeMatchMultiLabel:
         self.num_classes = num_classes
         self.criterion = criterion
         self.consistency_criterion = consistency_criterion
+
+        # ==============================
+        # 新增
+        # ==============================
+        self.loss_type = str(loss_type).lower()
+        if self.loss_type not in ("asl", "bce"):
+            raise ValueError(
+                f"Unsupported loss_type={loss_type}. Expected 'asl' or 'bce'."
+            )
 
         self.T = T
         self.use_hard_label = hard_label
@@ -137,6 +146,26 @@ class FreeMatchMultiLabel:
     # ------------------------------------------------------------------ utils
     def _to_device(self, *tensors):
         return [t.to(self.device) for t in tensors]
+
+    def _update_loss_schedule(self):
+        """
+        Update loss-specific training schedule.
+        ASL:
+            progressively enables gamma / clipping
+            during the first asl_warmup_ratio of training.
+        BCE:
+            no warmup is required.
+        """
+
+        if self.loss_type != "asl":
+            return
+
+        if not hasattr(self.criterion, "set_progress"):
+            return
+
+        warmup_iters = max(1, int(self.num_train_iter * self.asl_warmup_ratio))
+        progress = min(1.0,self.it / warmup_iters)
+        self.criterion.set_progress(progress)
 
     def _per_class_threshold(self):
         """per_class_thresh[c] = time_p * (p_model[c] / max(p_model)), clamped."""
@@ -195,6 +224,20 @@ class FreeMatchMultiLabel:
     def _sup_loss(self, logits_x_lb, y_lb):
         """Supervised (ASL / BCE) loss with effective-number (class-balanced) re-weighting."""
         per_elem = self.criterion(logits_x_lb, y_lb)  # [B, C]
+        # 防止错误使用 reduction='mean'
+        if per_elem.ndim == 0:
+            raise RuntimeError(
+                "Supervised criterion returned a scalar. "
+                "FreeMatch requires reduction='none' "
+                "so that the loss shape is [B, C]."
+            )
+        if per_elem.shape != y_lb.shape:
+            raise RuntimeError(
+                f"Loss shape mismatch: "
+                f"loss={tuple(per_elem.shape)}, "
+                f"target={tuple(y_lb.shape)}"
+            )
+
         if self.use_class_balancing:
             with torch.no_grad():
                 class_weight = self._class_balancing_weight()
@@ -231,12 +274,16 @@ class FreeMatchMultiLabel:
     #         return per_elem.mean()
 
     def sup_train_step(self, x_lb, y_lb):
-        """Supervised-only step (used for full-supervision baselines / no-unlabeled runs)."""
+        """Supervised-only step (used for full-supervision baselines / no-unlabeled runs).
+        Compatible with:ASL     BCE
+        """
         x_lb, y_lb = self._to_device(x_lb, y_lb)
         self.it += 1
-        if hasattr(self.criterion, "set_progress"):
-            progress = min(1.0, self.it / max(1, int(self.num_train_iter * self.asl_warmup_ratio)))
-            self.criterion.set_progress(progress)
+        # if hasattr(self.criterion, "set_progress"):
+        #     progress = min(1.0, self.it / max(1, int(self.num_train_iter * self.asl_warmup_ratio)))
+        #     self.criterion.set_progress(progress)
+        # ASL warmup; BCE automatically skips
+        self._update_loss_schedule()
         with self.amp_cm:
             logits_x_lb = self.model(x_lb)
             sup_loss = self._sup_loss(logits_x_lb, y_lb)
@@ -255,10 +302,15 @@ class FreeMatchMultiLabel:
         x_lb, y_lb, x_ulb_w, x_ulb_s = self._to_device(x_lb, y_lb, x_ulb_w, x_ulb_s)
         self.it += 1
 
-        # ASL warmup: first ``asl_warmup_ratio`` of training behaves like BCE.
-        if hasattr(self.criterion, "set_progress"):
-            progress = min(1.0, self.it / max(1, int(self.num_train_iter * self.asl_warmup_ratio)))
-            self.criterion.set_progress(progress)
+        # # ASL warmup: first ``asl_warmup_ratio`` of training behaves like BCE.
+        # if hasattr(self.criterion, "set_progress"):
+        #     progress = min(1.0, self.it / max(1, int(self.num_train_iter * self.asl_warmup_ratio)))
+        #     self.criterion.set_progress(progress)
+        # ================================
+        # ASL → warmup
+        # BCE → no-op
+        # ================================
+        self._update_loss_schedule()
 
         # ---- forward (student) ----
         with self.amp_cm:
@@ -272,19 +324,28 @@ class FreeMatchMultiLabel:
             with torch.no_grad():
                 teacher = self.ema_model if self.use_ema_teacher else self.model
                 logits_x_ulb_w = teacher(x_ulb_w)
-                probs_x_ulb_w = torch.sigmoid(logits_x_ulb_w)
+                probs_x_ulb_w = torch.sigmoid(logits_x_ulb_w.float())
                 self._update_threshold(probs_x_ulb_w)
 
                 thresh = self._per_class_threshold()  # [C]
                 mask = probs_x_ulb_w > thresh.unsqueeze(0)  # [U, C] bool
+                # pos_mask = prob >= tau_pos
+                # neg_mask = prob <= tau_neg
+                # mask = pos_mask | neg_mask
                 if self.use_hard_label:
                     pseudo_label = (probs_x_ulb_w > thresh.unsqueeze(0)).float()
                 else:
-                    pseudo_label = torch.sigmoid(logits_x_ulb_w / self.T)  # sharpened soft labels
+                    pseudo_label = torch.sigmoid(logits_x_ulb_w.float() / self.T)  # sharpened soft labels
+                    pseudo_label = pseudo_label.clamp(1e-6,1.0 - 1e-6)
                 pseudo_label = pseudo_label.float()
 
             # ---- unsupervised consistency loss (masked) ----
             per_elem_unsup = self.consistency_criterion(logits_x_ulb_s, pseudo_label)  # [U, C]
+
+            if per_elem_unsup.ndim == 0:
+                raise RuntimeError("Consistency criterion must use reduction='none'.")
+            if per_elem_unsup.shape != pseudo_label.shape:
+                raise RuntimeError(f"Consistency loss shape mismatch: {tuple(per_elem_unsup.shape)} vs {tuple(pseudo_label.shape)}")
 
             # 无标签一致性用置信度软权重
             # if mask.sum() > 0:
@@ -376,14 +437,14 @@ class FreeMatchMultiLabel:
 
 if __name__ == "__main__":
     # Smoke test with random data (no dataset needed).
-    from .losses import build_loss
-    from .models import build_model
+    from losses import build_loss
+    from models import build_model
 
     torch.manual_seed(0)
     model = build_model(15, backbone="resnet50", variant="gcn", pretrained=False,
                         adj_file=None, inp=None)
     algo = FreeMatchMultiLabel(model, 15, build_loss("asl", reduction="none"),
-                               nn.BCEWithLogitsLoss(reduction="none"),
+                               build_loss("asl_soft", reduction="none"),
                                device="cpu", use_ema_teacher=True)
     algo.num_train_iter = 1000
     x_lb = torch.randn(8, 3, 224, 224)

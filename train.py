@@ -14,7 +14,7 @@ Pipeline
 Usage
 -----
     python train.py --c configs/freematch_mlgcn.yaml
-    python train.py --c configs/freematch_mlgcn.yaml --save_name freematch_mlgcn_clip
+    python train.py --c configs/freematch_mlgcn.yaml --save_name test_adj
 """
 import argparse
 import math
@@ -40,7 +40,7 @@ if sys.platform.startswith("win"):
         pass
 
 from data import MultiLabelDataset, collate_fn
-from mlgcn import build_model, load_class_embeddings, build_loss, FreeMatchMultiLabel
+from mlgcn import build_model, build_loss, FreeMatchMultiLabel
 from mlgcn.metrics import format_report
 
 # Single source of image normalisation stats (from the private dataset).
@@ -82,16 +82,19 @@ def add_argument(parser):
                         help="class-embedding source for the GCN head")
     parser.add_argument("--emb_model", type=str, default="openai/clip-vit-base-patch32",
                         help="HuggingFace CLIP model used when --embedding clip")
-    parser.add_argument("--recompute_adj", type=str2bool, default=False,
-                        help="rebuild label-correlation adjacency from train_anno.json instead of custom_adj.pkl")
-    parser.add_argument("--adj_smoothing", type=float, default=0.0,
-                        help="additive smoothing for co-occurrence when --recompute_adj")
+    # parser.add_argument("--recompute_adj", type=str2bool, default=False,
+    #                     help="rebuild label-correlation adjacency from train_anno.json instead of custom_adj.pkl")
+    # parser.add_argument("--adj_smoothing", type=float, default=0.0,
+    #                     help="additive smoothing for co-occurrence when --recompute_adj")
 
     # loss
-    parser.add_argument("--loss", type=str, default="asl", choices=["asl", "bce"])
+    parser.add_argument("--loss", type=str, default="asl", choices=["asl", "bce"], help="multi-label loss: asl or bce")
     parser.add_argument("--asl_gamma_neg", type=float, default=4.0)
-    parser.add_argument("--asl_gamma_pos", type=float, default=1.0)
+    parser.add_argument("--asl_gamma_pos", type=float, default=0.0)
     parser.add_argument("--asl_clip", type=float, default=0.05)
+    parser.add_argument("--asl_soft_gamma_neg", type=float, default=2.0)
+    parser.add_argument("--asl_soft_gamma_pos", type=float, default=0.0)
+
     parser.add_argument("--use_class_balancing", type=str2bool, default=True)
     parser.add_argument("--oversample", type=str2bool, default=False,
                         help="class-balanced over-sampling (effective-number) of labeled data")
@@ -190,8 +193,6 @@ def make_args(config_path=None, overrides=None):
     args = parser.parse_args([])
     _apply_config(args, config_path, overrides)
     # resolve adj / inp defaults
-    if args.adj_file is None:
-        args.adj_file = os.path.join(args.data_dir, "custom_adj.pkl")
     if args.inp_file is None:
         args.inp_file = os.path.join(args.data_dir, "custom_glove_word2vec.pkl")
     return args
@@ -223,8 +224,6 @@ def get_args():
                         setattr(args, k, v)
     args = parser.parse_args(namespace=args)  # CLI on top of everything
     # resolve adj / inp defaults
-    if args.adj_file is None:
-        args.adj_file = os.path.join(args.data_dir, "custom_adj.pkl")
     if args.inp_file is None:
         args.inp_file = os.path.join(args.data_dir, "custom_glove_word2vec.pkl")
     if getattr(args, "no_amp", False):
@@ -362,29 +361,28 @@ _FEAT = {"resnet18": 512, "resnet34": 512, "resnet50": 2048, "resnet101": 2048}
 
 
 def build_model_from_args(args, inp, num_classes, adj_source=None):
-    if adj_source is None:
-        adj_source = args.adj_file
     return build_model(num_classes, backbone=args.backbone, variant=args.variant,
                        pretrained=args.pretrained, t=args.gcn_t, adj_file=adj_source,
                        inp=inp, gcn_hidden=args.gcn_hidden, feature_dim=_FEAT.get(args.backbone, 2048))
 
-
-def _resolve_adj_source(args, save_path=None):
+def _resolve_adj_source(args):
     """Return the label-correlation adjacency source."""
-    if getattr(args, "recompute_adj", False):
+    if args.adj_file is None or not os.path.exists(args.adj_file):
+        print(f'[train] 重建 ML-GCN 标签相关性图')
         anno_path = os.path.join(args.data_dir, "data", "train_anno.json")
         from mlgcn.models import label_cooccurrence_from_annotations
         P = label_cooccurrence_from_annotations(
             anno_path, args.num_classes, smoothing=getattr(args, "adj_smoothing", 0.0))
         print(f"[train] rebuilt label-correlation adjacency from {anno_path}")
-        if save_path:
-            import pickle as _pkl
-            out = os.path.join(save_path, "rebuilt_adj.pkl")
-            with open(out, "wb") as f:
-                _pkl.dump({"P": P}, f)
-            print(f"[train] saved rebuilt adjacency to {out}")
+        import pickle as _pkl
+        out = os.path.join(args.data_dir, "custom_adj.pkl")
+        with open(out, "wb") as f:
+            _pkl.dump({"P": P}, f)
+        print(f"[train] saved rebuilt adjacency to {out}")
         return P
-    return getattr(args, "adj_file", None)
+    else:
+        print(f'[train] 使用已有ML-GCN标签相关性图')
+        return getattr(args, "adj_file", None)
 
 
 def build_optimizer(args, model):
@@ -458,25 +456,72 @@ def train(args):
         print(f"[train] labeled={len(lb_loader.dataset)}, unlabeled={len(ulb_loader.dataset)}, "
               f"val={len(val_loader.dataset)}")
 
-        # # --- model ---
-        # model = build_model_from_args(args, inp, args.num_classes).to(device)
-
         # --- model ---
         # Rebuild the label-correlation adjacency from train annotations when requested
         # (instead of a stale custom_adj.pkl), then build the model with the chosen embeddings.
-        adj_source = _resolve_adj_source(args, save_path)
+        adj_source = _resolve_adj_source(args)
         model = build_model_from_args(args, inp, args.num_classes, adj_source=adj_source).to(device)
 
         print(f"[train] model={args.variant}/{args.backbone}, params={sum(p.numel() for p in model.parameters()):,}")
 
         # --- losses ---
-        criterion = build_loss(args.loss, gamma_neg=args.asl_gamma_neg,
-                               gamma_pos=args.asl_gamma_pos, clip=args.asl_clip, reduction="none")
-        consistency_criterion = nn.BCEWithLogitsLoss(reduction="none")
+        # criterion = build_loss(args.loss, gamma_neg=args.asl_gamma_neg,
+        #                        gamma_pos=args.asl_gamma_pos, clip=args.asl_clip, reduction="none")
+        # consistency_criterion = nn.BCEWithLogitsLoss(reduction="none")
+        if args.loss == "asl":
+            # --------------------------------------------------------
+            # 1. labeled: hard-label ASL
+            # target:{0,1}      shape: [B,C]
+            # --------------------------------------------------------
+            criterion = build_loss(
+                "asl",
+                gamma_neg=args.asl_gamma_neg,
+                gamma_pos=args.asl_gamma_pos,
+                clip=args.asl_clip,
+                # 必须 none
+                reduction="none",
+            )
+            # --------------------------------------------------------
+            # 2. unlabeled: soft pseudo-label ASL
+            # teacher target: probability in [0,1]
+            # output:[U,C]
+            # --------------------------------------------------------
+            consistency_criterion = build_loss(
+                "asl_soft",
+                gamma_neg=args.asl_soft_gamma_neg,
+                gamma_pos=args.asl_soft_gamma_pos,
+                # 必须 none
+                reduction="none",
+            )
+        elif args.loss == "bce":
+            # --------------------------------------------------------
+            # BCE supervised
+            criterion = build_loss(
+                "bce",
+                reduction="none",
+            )
+            # --------------------------------------------------------
+            # BCE unsupervised
+            # BCEWithLogits 同样允许 target 为 [0,1] 连续值，
+            # 所以可以直接用于 soft pseudo-label。
+            # --------------------------------------------------------
+            consistency_criterion = build_loss(
+                "bce",
+                reduction="none",
+            )
+
+        else:
+            raise ValueError(f"Unsupported loss: {args.loss}")
+
+        print(
+            f"[train] loss={args.loss} | "
+            f"supervised={criterion.__class__.__name__} | "
+            f"unsupervised={consistency_criterion.__class__.__name__}"
+        )
 
         # --- algorithm ---
         algo = FreeMatchMultiLabel(
-            model, args.num_classes, criterion, consistency_criterion,
+            model, args.num_classes, criterion, consistency_criterion, loss_type=args.loss,
             T=args.T, hard_label=args.hard_label, ema_p=args.ema_p, ema_m=args.ema_m,
             use_ema_teacher=args.use_ema_teacher, use_quantile=args.use_quantile,
             clip_thresh=args.clip_thresh, lambda_u=args.lambda_u, lambda_e=args.lambda_e,
@@ -520,6 +565,12 @@ def train(args):
             print(f"[train] resumed from {resume_path}" if resume_path != save_path + "/best.pth" else
                   f"[train] resumed from {resume_path}")
 
+        if args.loss == "asl":
+            print(
+                f"[loss] ASL supervised: gamma_neg={args.asl_gamma_neg}, gamma_pos={args.asl_gamma_pos}, "
+                f"clip={args.asl_clip}")
+            print(f"[loss] ASL unsupervised: gamma_neg={args.asl_soft_gamma_neg}, "
+                  f"gamma_pos={args.asl_soft_gamma_pos}")
         print("[train] start training")
         has_ulb = len(ulb_loader.dataset) > 0 and args.lambda_u > 0
         for epoch in range(start_epoch, args.epochs):

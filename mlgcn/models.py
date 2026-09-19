@@ -35,57 +35,8 @@ import torch.nn.functional as F
 import torchvision.models as models
 from torch.nn import Parameter
 
-# ---------------------------------------------------------------------------
-# Adjacency matrix construction (copied / lightly tuned from models_mlgcn.py)
-# ---------------------------------------------------------------------------
-# def gen_A(num_classes, t, adj_file):
-#     """Read ``{"P": [C, C]}``, binarise at threshold ``t`` and re-weight per ML-GCN."""
-#     with open(adj_file, "rb") as f:
-#         result = pickle.load(f)
-#     P = result["P"]                                   # conditional probability matrix, values in [0, 1]
-#     A = (P >= t).astype(np.float32)
-#     nums = np.sum(A, axis=1, dtype=np.float32).reshape(-1, 1)
-#     _adj = A
-#     _nums = nums
 
-#     # ML-GCN paper re-weighting: neighbour weight = p / degree, self loop = 1 - p
-#     p = 0.2
-#     for i in range(num_classes):
-#         if _nums[i] > 0:
-#             _adj[i] = _adj[i] * (p / _nums[i])
-#         _adj[i, i] = 1.0 - p
-#     return _adj
-def gen_A(num_classes, t, adj_source):
-    """Binarise a conditional-probability matrix P at threshold ``t`` and re-weight per ML-GCN.
-
-    ``adj_source`` may be any of:
-      * a path to a pickle ``{"P": [C, C]}``  (the original custom_adj.pkl style)
-      * a mapping / dict carrying the key "P"
-      * a numpy [C, C] conditional-probability matrix directly (e.g. from
-        :func:`label_cooccurrence_from_annotations`).
-    """
-    if isinstance(adj_source, (str, os.PathLike)):
-        with open(adj_source, "rb") as f:
-            result = pickle.load(f)
-        P = result["P"]
-    elif isinstance(adj_source, dict):
-        P = adj_source.get("P", adj_source)
-    else:
-        P = adj_source
-    P = np.asarray(P, dtype=np.float32)               # conditional probability matrix, values in [0, 1]
-    A = (P >= t).astype(np.float32)
-    nums = np.sum(A, axis=1, dtype=np.float32).reshape(-1, 1)
-    _adj = A
-    _nums = nums
-
-    # ML-GCN paper re-weighting: neighbour weight = p / degree, self loop = 1 - p
-    p = 0.2
-    for i in range(num_classes):
-        if _nums[i] > 0:
-            _adj[i] = _adj[i] * (p / _nums[i])
-        _adj[i, i] = 1.0 - p
-    return _adj
-
+# 标签关系图构建，得到P -> [C, C]
 def label_cooccurrence_from_annotations(anno_path, num_classes, smoothing=0.0, self_loop=True):
     """Rebuild the label-correlation matrix ``P`` directly from a train annotation file.
 
@@ -126,6 +77,42 @@ def label_cooccurrence_from_annotations(anno_path, num_classes, smoothing=0.0, s
     return P.astype(np.float32)
 
 
+# ---------------------------------------------------------------------------
+# Adjacency matrix construction (copied / lightly tuned from models_mlgcn.py)
+# ---------------------------------------------------------------------------
+def gen_A(num_classes, t, adj_source):
+    """Binarise a conditional-probability matrix P at threshold ``t`` and re-weight per ML-GCN.
+
+    ``adj_source`` may be any of:
+      * a path to a pickle ``{"P": [C, C]}``  (the original custom_adj.pkl style)
+      * a mapping / dict carrying the key "P"
+      * a numpy [C, C] conditional-probability matrix directly (e.g. from
+        :func:`label_cooccurrence_from_annotations`).
+    """
+    if isinstance(adj_source, (str, os.PathLike)):
+        with open(adj_source, "rb") as f:
+            result = pickle.load(f)
+        P = result["P"]
+    elif isinstance(adj_source, dict):
+        P = adj_source.get("P", adj_source)
+    else:
+        P = adj_source
+    P = np.asarray(P, dtype=np.float32)  # conditional probability matrix, values in [0, 1]
+    A = (P >= t).astype(np.float32)
+    nums = np.sum(A, axis=1, dtype=np.float32).reshape(-1, 1)
+    _adj = A
+    _nums = nums
+
+    # ML-GCN paper re-weighting: neighbour weight = p / degree, self loop = 1 - p
+    p = 0.2
+    for i in range(num_classes):
+        if _nums[i] > 0:
+            _adj[i] = _adj[i] * (p / _nums[i])
+        _adj[i, i] = 1.0 - p
+    return _adj
+
+
+# 对P进行gen_A阈值化，邻居权重处理得到A
 def build_adjacency_from_annotations(anno_path, num_classes, t=0.4, **kw):
     """One-shot: rebuild the binarised/re-weighted ML-GCN adjacency from train annotations.
 
@@ -136,6 +123,17 @@ def build_adjacency_from_annotations(anno_path, num_classes, t=0.4, **kw):
     """
     P = label_cooccurrence_from_annotations(anno_path, num_classes, **kw)
     return gen_A(num_classes, t, P)
+
+
+# 对A标准图卷积归一化得到 _adj
+def gen_adj(A):
+    """Standard symmetric GCN normalisation: D^{-1/2} A D^{-1/2}."""
+    D = torch.sum(A, dim=1)
+    D = torch.pow(D, -0.5)
+    D[torch.isinf(D)] = 0.0
+    D = torch.diag(D)
+    adj = torch.matmul(torch.matmul(D, A), D)
+    return adj
 
 
 def load_clip_class_embeddings(class_names, model_name="openai/clip-vit-base-patch32",
@@ -157,7 +155,7 @@ def load_clip_class_embeddings(class_names, model_name="openai/clip-vit-base-pat
     """
     try:
         import os as _os
-        _os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "15")   # bound per-request timeout
+        _os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "15")  # bound per-request timeout
         import torch
         from transformers import CLIPModel, CLIPProcessor
         dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -180,18 +178,13 @@ def load_clip_class_embeddings(class_names, model_name="openai/clip-vit-base-pat
         print(f"[models] WARNING: CLIP text embedding failed ({e}); falling back to random init.")
         return np.random.randn(len(class_names), 512).astype(np.float32)
 
-def gen_adj(A):
-    """Standard symmetric GCN normalisation: D^{-1/2} A D^{-1/2}."""
-    D = torch.sum(A, dim=1)
-    D = torch.pow(D, -0.5)
-    D[torch.isinf(D)] = 0.0
-    D = torch.diag(D)
-    adj = torch.matmul(torch.matmul(D, A), D)
-    return adj
-
 
 class GraphConvolution(nn.Module):
-    """GCN layer with optional (broadcastable) bias, as used by ML-GCN."""
+    """GCN layer with optional (broadcastable) bias, as used by ML-GCN.
+        support = input @ weight
+        output = adj @ support
+        即 H′ = AHW
+    """
 
     def __init__(self, in_features, out_features, bias=False):
         super(GraphConvolution, self).__init__()
@@ -235,8 +228,8 @@ class GCNResnet(nn.Module):
             in_channel = inp.shape[1]
         self.pooling = nn.AdaptiveMaxPool2d(1) if pooling == "max" else nn.AdaptiveAvgPool2d(1)
 
-        self.gc1 = GraphConvolution(in_channel, gcn_hidden)
-        self.gc2 = GraphConvolution(gcn_hidden, feature_dim)
+        self.gc1 = GraphConvolution(in_channel, gcn_hidden)  # 300 -> 1024
+        self.gc2 = GraphConvolution(gcn_hidden, feature_dim)  # 1024 -> 2048
         self.relu = nn.LeakyReLU(0.2)
 
         # Pre-compute + register the normalised adjacency matrix (non-trainable buffer).
@@ -265,20 +258,21 @@ class GCNResnet(nn.Module):
         self.image_normalization_std = std if std is not None else [0.2077, 0.2220, 0.2262]
 
     def forward(self, x):
-        feature = self.features(x)                        # (B, feature_dim, h, w)
-        feature = self.pooling(feature)
-        feature = feature.view(feature.size(0), -1)       # (B, feature_dim)
+        # 输入 x = [B,3,H,W]
+        feature = self.features(x)                  # ResNet->(B, feature_dim, h, w)
+        feature = self.pooling(feature)             # 全局池化->(B, feature_dim, 1, 1)
+        feature = feature.view(feature.size(0), -1) # 拉平 -> (B, feature_dim)
 
-        inp = self.inp                                    # (C, in_channel)
-        adj = self.adj                                    # (C, C)
+        inp = self.inp  # (C, in_channel)
+        adj = self.adj  # (C, C)
 
-        x_gcn = self.gc1(inp, adj)                        # (C, gcn_hidden)
+        x_gcn = self.gc1(inp, adj)  # 隐藏层gc1->(C, gcn_hidden)
         x_gcn = self.relu(x_gcn)
-        x_gcn = self.gc2(x_gcn, adj)                      # (C, feature_dim)
-        x_gcn = x_gcn.transpose(0, 1)                     # (feature_dim, C)
+        x_gcn = self.gc2(x_gcn, adj)  # 隐藏层gc2->(C, feature_dim)
+        x_gcn = x_gcn.transpose(0, 1)  # (C, feature_dim) -> (feature_dim, C)
 
-        logits = torch.matmul(feature, x_gcn)             # (B, C)
-        return logits
+        logits = torch.matmul(feature, x_gcn)  # (B, feature_dim)×(feature_dim, C) -> (B, C)
+        return logits  # logits，而不是概率。
 
     def get_config_optim(self, lr, lrp):
         return [
@@ -293,7 +287,9 @@ class GCNResnet(nn.Module):
 # Plain baselines (for ablations): same backbone + GMP/GAP, linear classifier.
 # ---------------------------------------------------------------------------
 class PlainResNet(nn.Module):
-    """Linear-head baseline: ResNet backbone -> GMP -> Linear, with optional bias flag."""
+    """Linear-head baseline: ResNet backbone -> GMP -> Linear, with optional bias flag.
+        Image -> ResNet -> Pooling -> Linear -> C
+    """
 
     def __init__(self, model, num_classes, pooling="max", bias=True,
                  mean=None, std=None):
@@ -325,10 +321,10 @@ class PlainResNet(nn.Module):
             layer.bias.data.uniform_(-stdv, stdv)
 
     def forward(self, x):
-        feature = self.features(x)
-        feature = self.pooling(feature)
-        feature = feature.view(feature.size(0), -1)
-        return self.fc(feature)
+        feature = self.features(x)                      # ResNet->(B, feature_dim, h, w)
+        feature = self.pooling(feature)                 # 全局池化->(B, feature_dim, 1, 1)
+        feature = feature.view(feature.size(0), -1)     # 拉平 -> (B, feature_dim)
+        return self.fc(feature)                         # logits(B, C)
 
     def get_config_optim(self, lr, lrp):
         return [
@@ -343,6 +339,7 @@ class PlainResNet(nn.Module):
 BACKBONE_ARCHS = ("resnet18", "resnet34", "resnet50", "resnet101")
 
 
+# 加载 ImageNet 预训练权重，同时兼容不同版本的 torchvision
 def _backbone(name, pretrained=True):
     if name not in BACKBONE_ARCHS:
         raise ValueError(f"Unsupported backbone '{name}'. Choose one of {BACKBONE_ARCHS}.")
@@ -371,7 +368,7 @@ def build_model(num_classes, backbone="resnet50", variant="gcn",
     feat_dim = prefix[backbone] if backbone in prefix else feature_dim
 
     model = _backbone(backbone, pretrained=pretrained)
-    
+
     if inp is not None:
         inp = np.asarray(inp, dtype=np.float32)
         in_channel = inp.shape[1]
@@ -399,12 +396,13 @@ def load_class_embeddings(inp_file):
 if __name__ == "__main__":
     # Quick smoke test.
     import torch
-    adj_file = r"/root/autodl-tmp/my_semi_learing/data/custom_muti/custom_adj.pkl"
-    inp_file = r"/root/autodl-tmp/my_semi_learing/data/custom_muti/custom_glove_word2vec.pkl"
+
+    adj_file = r"dataset/custom_muti/custom_adj.pkl"
+    inp_file = r"dataset/custom_muti/custom_glove_word2vec.pkl"
     inp = load_class_embeddings(inp_file)
     m = build_model(num_classes=15, backbone="resnet50", variant="gcn",
                     pretrained=False, t=0.4, adj_file=adj_file, inp=inp)
-    x = torch.randn(2, 3, 224, 224)
+    x = torch.randn(8, 3, 224, 224)
     out = m(x)
     print("GCN output:", out.shape, "| params:", sum(p.numel() for p in m.parameters()))
     for v in ("gap", "gmp"):

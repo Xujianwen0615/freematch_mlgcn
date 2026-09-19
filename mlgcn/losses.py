@@ -1,167 +1,545 @@
 # -*- coding: utf-8 -*-
+
 """
-Loss functions for multi-label classification.
+Loss functions for semi-supervised multi-label classification.
+
+Supervised:
+    AsymmetricLoss
+        hard multi-hot labels {0,1}
+
+Unsupervised:
+    AsymmetricLossSoft
+        soft pseudo-labels in [0,1]
 
 Reference:
-  - Asymmetric Loss (ASL): https://github.com/Alibaba-MIIL/ASL.git  (Ben-Baruch et al., ECCV 2020)
-  - Adapted from the prior working implementation in
-    D:\\freematch_mlgcn\\semilearn\\core\\criterions\\asl_loss.py
-
-Provided
---------
-  * AsymmetricLoss       — hard-label ASL (for the supervised / labeled part).
-  * AsymmetricLossSoft   — soft-label ASL (for the unsupervised consistency part, no hard clipping).
-  * build_loss           — factory returning any of 'asl' / 'bce' / 'bce_w' (weighted BCE).
+    Alibaba-MIIL/ASL
+    https://github.com/Alibaba-MIIL/ASL
 """
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
+
+# ============================================================
+# 1. ASL for labeled / supervised samples
+# ============================================================
 
 class AsymmetricLoss(nn.Module):
     """
-    Asymmetric Loss (hard-label version) for the labeled data.
+    Asymmetric Loss for supervised multi-label classification.
 
-    Core ideas:
-      * Asymmetric focusing: negatives use gamma_neg (>> 1) to down-weight easy negatives,
-        positives use a small gamma_pos.
-      * Hard probability clipping: negatives with p < clip are fully excluded.
+    Input
+    -----
+    logits:
+        [B, C], raw model outputs.
+        DO NOT apply sigmoid before passing them here.
 
-    Supports a progressive warmup: while ``_progress < 1`` the effective gamma_neg / clip are
-    scaled linearly from 0 to their target, effectively behaving like BCE early in training.
+    targets:
+        [B, C], binary multi-label targets in {0, 1}.
+
+    Output
+    ------
+    reduction='none':
+        [B, C]
+
+    reduction='mean':
+        scalar
+
+    reduction='sum':
+        scalar
     """
 
-    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-8, reduction="mean"):
+    def __init__(
+        self,
+        gamma_neg=4.0,
+        gamma_pos=0.0,
+        clip=0.05,
+        eps=1e-8,
+        reduction="mean",
+        disable_torch_grad_focal_loss=True,
+    ):
         super().__init__()
-        self.gamma_neg = gamma_neg
-        self.gamma_pos = gamma_pos
-        self.clip = clip
+
+        self.gamma_neg = float(gamma_neg)
+        self.gamma_pos = float(gamma_pos)
+        self.clip = float(clip) if clip is not None else 0.0
         self.eps = eps
         self.reduction = reduction
+
+        self.disable_torch_grad_focal_loss = (
+            disable_torch_grad_focal_loss
+        )
+
+        # Used by FreeMatch ASL warmup.
         self._progress = 1.0
 
+
     def set_progress(self, progress):
-        """Set training progress in [0, 1] for the ASL warmup (0 → behaves like BCE)."""
-        self._progress = min(max(float(progress), 0.0), 1.0)
+        """
+        progress:
+            0 -> approximately BCE
+            1 -> full ASL
+        """
+        self._progress = max(
+            0.0,
+            min(float(progress), 1.0)
+        )
+
 
     def forward(self, logits, targets):
-        # float32 to avoid AMP float16 underflow (eps / clamp).
+
+        # AMP safe
         logits = logits.float()
         targets = targets.float()
+
+        # ----------------------------------------------------
+        # ASL warmup
+        # ----------------------------------------------------
 
         gamma_neg = self.gamma_neg * self._progress
+        gamma_pos = self.gamma_pos * self._progress
         clip = self.clip * self._progress
 
-        prob = torch.sigmoid(logits)
-        prob = torch.clamp(prob, self.eps, 1.0 - self.eps)
+        # ----------------------------------------------------
+        # Probability
+        # ----------------------------------------------------
 
-        # Positive loss:  L+ = -(1-p)^{gamma+} log(p)
-        pos_weight = (1.0 - prob).pow(self.gamma_pos)
-        pos_loss = -targets * pos_weight * torch.log(prob)
+        xs_pos = torch.sigmoid(logits)
 
-        # Negative loss with hard clipping.
-        prob_shifted = torch.clamp(prob - clip, min=0.0) if clip > 0 else prob
-        neg_weight = prob_shifted.pow(gamma_neg)
-        neg_loss = -(1.0 - targets) * neg_weight * torch.log(1.0 - prob_shifted + self.eps)
+        xs_pos = torch.clamp(
+            xs_pos,
+            min=self.eps,
+            max=1.0 - self.eps
+        )
 
-        loss = pos_loss + neg_loss  # [B, C]
+        xs_neg = 1.0 - xs_pos
+
+        # ----------------------------------------------------
+        # Asymmetric clipping
+        #
+        # official ASL:
+        #
+        # xs_neg = (xs_neg + clip).clamp(max=1)
+        # ----------------------------------------------------
+
+        if clip > 0:
+            xs_neg = (
+                xs_neg + clip
+            ).clamp(max=1.0)
+
+        # ----------------------------------------------------
+        # Basic binary cross entropy
+        #
+        # Positive:
+        #     y log(p)
+        #
+        # Negative:
+        #     (1-y) log(p_neg)
+        # ----------------------------------------------------
+
+        loss_pos = (
+            targets *
+            torch.log(xs_pos.clamp(min=self.eps))
+        )
+
+        loss_neg = (
+            (1.0 - targets) *
+            torch.log(xs_neg.clamp(min=self.eps))
+        )
+
+        loss = loss_pos + loss_neg
+
+        # ----------------------------------------------------
+        # Asymmetric focusing
+        # ----------------------------------------------------
+
+        if gamma_neg > 0 or gamma_pos > 0:
+
+            if self.disable_torch_grad_focal_loss:
+
+                with torch.no_grad():
+
+                    pt = (
+                        xs_pos * targets
+                        +
+                        xs_neg * (1.0 - targets)
+                    )
+
+                    one_sided_gamma = (
+                        gamma_pos * targets
+                        +
+                        gamma_neg * (1.0 - targets)
+                    )
+
+                    asymmetric_weight = torch.pow(
+                        1.0 - pt,
+                        one_sided_gamma
+                    )
+
+            else:
+
+                pt = (
+                    xs_pos * targets
+                    +
+                    xs_neg * (1.0 - targets)
+                )
+
+                one_sided_gamma = (
+                    gamma_pos * targets
+                    +
+                    gamma_neg * (1.0 - targets)
+                )
+
+                asymmetric_weight = torch.pow(
+                    1.0 - pt,
+                    one_sided_gamma
+                )
+
+            loss = loss * asymmetric_weight
+
+        # official implementation calculates negative log-likelihood
+        loss = -loss
+
+        # loss shape before reduction:
+        #
+        # [B, C]
 
         if self.reduction == "mean":
             return loss.mean()
-        elif self.reduction == "sum":
+
+        if self.reduction == "sum":
             return loss.sum()
-        return loss  # 'none'
+
+        if self.reduction == "none":
+            return loss
+
+        raise ValueError(
+            f"Unsupported reduction: {self.reduction}"
+        )
 
 
+# ============================================================
+# 2. ASL for soft pseudo labels
+# ============================================================
 class AsymmetricLossSoft(nn.Module):
     """
-    Asymmetric Loss (soft / pseudo-label version) for the unsupervised consistency part.
-
-    Unlike the hard version, no hard clipping is applied (a pseudo-label of 0.05 need not be a
-    true negative) — only asymmetric focusing re-weights samples/classes.
+    Numerically stable ASL for soft pseudo-labels.
+    targets: [B, C] continuous values in [0, 1]
     """
 
-    def __init__(self, gamma_neg=2, gamma_pos=0, eps=1e-8, reduction="none"):
+    def __init__(
+        self,
+        gamma_neg=2.0,
+        gamma_pos=0.0,
+        eps=1e-8,
+        reduction="none",
+        detach_focal_weight=True,
+    ):
         super().__init__()
-        self.gamma_neg = gamma_neg
-        self.gamma_pos = gamma_pos
-        self.eps = eps
+
+        self.gamma_neg = float(gamma_neg)
+        self.gamma_pos = float(gamma_pos)
+        self.eps = float(eps)
         self.reduction = reduction
+        self.detach_focal_weight = detach_focal_weight
 
     def forward(self, logits, targets):
+
+        # Always calculate ASL in fp32
         logits = logits.float()
         targets = targets.float()
 
+        # ------------------------------------------
+        # check inputs
+        # ------------------------------------------
+        if not torch.isfinite(logits).all():
+            raise RuntimeError(
+                "AsymmetricLossSoft received NaN/Inf logits."
+            )
+
+        if not torch.isfinite(targets).all():
+            raise RuntimeError(
+                "AsymmetricLossSoft received NaN/Inf targets."
+            )
+
+        # Avoid malformed pseudo labels
+        targets = targets.clamp(0.0, 1.0)
+
+        # ------------------------------------------
+        # probability only for focal weights
+        # ------------------------------------------
         prob = torch.sigmoid(logits)
-        prob = torch.clamp(prob, self.eps, 1.0 - self.eps)
 
-        pos_weight = (1.0 - prob).pow(self.gamma_pos)
-        pos_loss = -targets * pos_weight * torch.log(prob)
+        if self.detach_focal_weight:
+            with torch.no_grad():
 
-        neg_weight = prob.pow(self.gamma_neg)
-        neg_loss = -(1.0 - targets) * neg_weight * torch.log(1.0 - prob + self.eps)
+                pos_weight = (
+                    1.0 - prob
+                ).pow(self.gamma_pos)
 
-        loss = pos_loss + neg_loss  # [B, C]
+                neg_weight = (
+                    prob
+                ).pow(self.gamma_neg)
+
+        else:
+
+            pos_weight = (
+                1.0 - prob
+            ).pow(self.gamma_pos)
+
+            neg_weight = (
+                prob
+            ).pow(self.gamma_neg)
+
+        # ==========================================
+        # IMPORTANT:
+        # numerically stable log probabilities
+        #
+        # log(sigmoid(x))
+        #     = logsigmoid(x)
+        #
+        # log(1 - sigmoid(x))
+        #     = logsigmoid(-x)
+        # ==========================================
+
+        log_pos = F.logsigmoid(logits)
+        log_neg = F.logsigmoid(-logits)
+
+        # ------------------------------------------
+        # Soft ASL
+        # ------------------------------------------
+
+        pos_loss = (
+            -targets
+            * pos_weight
+            * log_pos
+        )
+
+        neg_loss = (
+            -(1.0 - targets)
+            * neg_weight
+            * log_neg
+        )
+
+        loss = pos_loss + neg_loss
+
+        # ------------------------------------------
+        # final safety check
+        # ------------------------------------------
+        if not torch.isfinite(loss).all():
+
+            bad = ~torch.isfinite(loss)
+
+            raise RuntimeError(
+                "NaN/Inf detected in AsymmetricLossSoft: "
+                f"bad={bad.sum().item()}, "
+                f"logit_min={logits.min().item():.4f}, "
+                f"logit_max={logits.max().item():.4f}, "
+                f"target_min={targets.min().item():.6f}, "
+                f"target_max={targets.max().item():.6f}"
+            )
 
         if self.reduction == "mean":
             return loss.mean()
-        elif self.reduction == "sum":
+
+        if self.reduction == "sum":
             return loss.sum()
-        return loss  # 'none'  → combine with per-(sample, class) mask on top
 
+        if self.reduction == "none":
+            return loss
 
-class WeightedBCEWithLogits(nn.Module):
-    """
-    Weighted binary cross-entropy with logits. ``weight`` is broadcast over the class dim
-    ([B, C] or [C]) and can be used to up-weight rare positive classes.
-    """
+        raise ValueError(
+            f"Unsupported reduction: {self.reduction}"
+        )
 
-    def __init__(self, reduction="mean", pos_weight=None):
+# ============================================================
+# 3. BCE baseline
+# ============================================================
+
+class BCEWithLogitsLoss(nn.Module):
+
+    def __init__(
+        self,
+        reduction="mean",
+        pos_weight=None
+    ):
         super().__init__()
+
         self.reduction = reduction
-        self.register_buffer("pos_weight", None)
-        self._pos_weight = pos_weight
+
+        if pos_weight is not None:
+            pos_weight = torch.as_tensor(
+                pos_weight,
+                dtype=torch.float32
+            )
+
+        self.register_buffer(
+            "pos_weight",
+            pos_weight
+        )
+
 
     def set_progress(self, progress):
-        pass  # BCE has no warmup.
-
-    def forward(self, logits, targets, weight=None):
-        loss = nn.functional.binary_cross_entropy_with_logits(
-            logits.float(), targets.float(),
-            pos_weight=self._pos_weight,
-            reduction="none",
-        )  # [B, C]
-        if weight is not None:
-            loss = loss * weight
-            if self.reduction == "mean":
-                return loss.sum() / weight.sum().clamp(min=1.0)
-        if self.reduction == "mean":
-            return loss.mean()
-        elif self.reduction == "sum":
-            return loss.sum()
-        return loss
+        # compatibility with FreeMatch
+        pass
 
 
-def build_loss(kind, **kwargs):
-    """Loss factory. kind in {asl, bce}."""
-    if kind == "asl":
-        return AsymmetricLoss(
-            gamma_neg=kwargs.get("gamma_neg", 4.0),
-            gamma_pos=kwargs.get("gamma_pos", 1.0),
-            clip=kwargs.get("clip", 0.05),
-            eps=kwargs.get("eps", 1e-8),
-            reduction=kwargs.get("reduction", "mean"),
+    def forward(
+        self,
+        logits,
+        targets,
+    ):
+
+        return F.binary_cross_entropy_with_logits(
+            logits.float(),
+            targets.float(),
+            pos_weight=self.pos_weight,
+            reduction=self.reduction,
         )
-    elif kind == "bce":
-        return WeightedBCEWithLogits(reduction=kwargs.get("reduction", "mean"))
-    else:
-        raise ValueError(f"Unknown loss kind '{kind}'.")
 
+
+# ============================================================
+# 4. Loss factory
+# ============================================================
+
+def build_loss(kind="asl", **kwargs):
+
+    kind = kind.lower()
+
+    # --------------------------------------------------------
+    # supervised ASL
+    # --------------------------------------------------------
+
+    if kind in (
+        "asl",
+        "asl_hard",
+    ):
+
+        return AsymmetricLoss(
+            gamma_neg=kwargs.get(
+                "gamma_neg", 4.0
+            ),
+            gamma_pos=kwargs.get(
+                "gamma_pos", 0.0
+            ),
+            clip=kwargs.get(
+                "clip", 0.05
+            ),
+            eps=kwargs.get(
+                "eps", 1e-8
+            ),
+            reduction=kwargs.get(
+                "reduction", "mean"
+            ),
+            disable_torch_grad_focal_loss=kwargs.get(
+                "disable_torch_grad_focal_loss",
+                True
+            ),
+        )
+
+    # --------------------------------------------------------
+    # unsupervised / soft pseudo-label ASL
+    # --------------------------------------------------------
+
+    elif kind in (
+        "asl_soft",
+        "soft_asl",
+    ):
+
+        return AsymmetricLossSoft(
+            gamma_neg=kwargs.get(
+                "gamma_neg", 2.0
+            ),
+            gamma_pos=kwargs.get(
+                "gamma_pos", 0.0
+            ),
+            eps=kwargs.get(
+                "eps", 1e-8
+            ),
+            reduction=kwargs.get(
+                "reduction", "none"
+            ),
+            detach_focal_weight=kwargs.get(
+                "detach_focal_weight",
+                True
+            ),
+        )
+
+    # --------------------------------------------------------
+    # BCE baseline
+    # --------------------------------------------------------
+
+    elif kind == "bce":
+
+        return BCEWithLogitsLoss(
+            reduction=kwargs.get(
+                "reduction", "mean"
+            ),
+            pos_weight=kwargs.get(
+                "pos_weight", None
+            ),
+        )
+
+    else:
+
+        raise ValueError(
+            f"Unknown loss kind: {kind}. "
+            "Choose from "
+            "{'asl', 'asl_hard', "
+            "'asl_soft', 'bce'}."
+        )
+
+
+# ============================================================
+# Smoke test
+# ============================================================
 
 if __name__ == "__main__":
+
     torch.manual_seed(0)
-    x = torch.randn(4, 15)
-    y = (torch.rand(4, 15) > 0.6).float()
-    for kind in ("asl", "bce"):
-        l = build_loss(kind, reduction="none")
-        v = l(x, y)
-        print(f"{kind}: loss shape {tuple(v.shape)} mean {v.mean().item():.4f}")
+
+    B = 8
+    C = 15
+
+    logits = torch.randn(B, C)
+
+    targets = (
+        torch.rand(B, C) > 0.8
+    ).float()
+
+    pseudo_targets = torch.rand(B, C)
+
+    # supervised ASL
+    sup_criterion = build_loss(
+        "asl",
+        reduction="none"
+    )
+
+    sup_loss = sup_criterion(
+        logits,
+        targets
+    )
+
+    print(
+        "supervised ASL:",
+        sup_loss.shape,
+        sup_loss.mean().item()
+    )
+
+    # unsupervised soft ASL
+    unsup_criterion = build_loss(
+        "asl_soft",
+        reduction="none"
+    )
+
+    unsup_loss = unsup_criterion(
+        logits,
+        pseudo_targets
+    )
+
+    print(
+        "soft ASL:",
+        unsup_loss.shape,
+        unsup_loss.mean().item()
+    )
