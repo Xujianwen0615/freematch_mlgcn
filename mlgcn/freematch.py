@@ -27,7 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .metrics import compute_metrics
+from .metrics import compute_logit_stats, compute_metrics
 
 
 def entropy_loss(mask, logits_s, prob_model, label_hist, fairness_weight=0.15,
@@ -405,10 +405,20 @@ class FreeMatchMultiLabel:
 
         all_logits = np.concatenate(all_logits, axis=0)
         all_targets = np.concatenate(all_targets, axis=0)
-        all_probs = 1.0 / (1.0 + np.exp(-all_logits))
+        stats = compute_logit_stats(all_logits)
+        self.log(
+            f"[{eval_name}] logits min={stats['min']:.4f} max={stats['max']:.4f} "
+            f"mean={stats['mean']:.4f} std={stats['std']:.4f} "
+            f"|x|>16={stats['abs_gt_16_ratio']:.3%} "
+            f"|x|>80={stats['abs_gt_80_ratio']:.3%} "
+            f"nonfinite={stats['nonfinite']}"
+        )
 
-        metrics = compute_metrics(all_targets, all_probs, threshold=threshold,
-                                  class_names=getattr(self, "class_names", None), eval_name=eval_name)
+        metrics = compute_metrics(
+            all_targets, all_logits, threshold=threshold,
+            class_names=getattr(self, "class_names", None), eval_name=eval_name,
+            from_logits=True,
+        )
         self.model.train()
         return metrics, all_logits, all_targets
 

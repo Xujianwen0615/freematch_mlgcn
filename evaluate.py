@@ -30,6 +30,7 @@ if sys.platform.startswith("win"):
 
 from data import MultiLabelDataset, collate_fn
 from mlgcn import build_model, compute_metrics, format_report
+from mlgcn.metrics import compute_logit_stats
 
 DEFAULT_MEAN = [0.2318, 0.2274, 0.2761]
 DEFAULT_STD = [0.2077, 0.2220, 0.2262]
@@ -125,10 +126,19 @@ def main():
             all_targets.append(y.numpy())
     all_logits = np.concatenate(all_logits, axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
-    probs = 1.0 / (1.0 + np.exp(-all_logits))
+    stats = compute_logit_stats(all_logits)
+    print(
+        f"[{args.phase}] logits min={stats['min']:.4f} max={stats['max']:.4f} "
+        f"mean={stats['mean']:.4f} std={stats['std']:.4f} "
+        f"|x|>16={stats['abs_gt_16_ratio']:.3%} "
+        f"|x|>80={stats['abs_gt_80_ratio']:.3%} "
+        f"nonfinite={stats['nonfinite']}"
+    )
 
-    metrics = compute_metrics(all_targets, probs, threshold=args.threshold,
-                              class_names=class_names, eval_name=args.phase)
+    metrics = compute_metrics(
+        all_targets, all_logits, threshold=args.threshold,
+        class_names=class_names, eval_name=args.phase, from_logits=True,
+    )
     print(format_report(metrics, args.phase))
 
     # CSV report

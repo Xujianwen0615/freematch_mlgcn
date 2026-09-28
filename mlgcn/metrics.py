@@ -2,32 +2,75 @@
 """
 Unified multi-label evaluation metrics.
 
-Given ground-truth binarized targets [N, C] in {0,1} and predicted probabilities [N, C],
-compute mAP, per-class AP / precision / recall, macro & micro F1 / precision / recall,
-and hamming loss.
+Given ground-truth binarized targets [N, C] in {0,1} and predicted probabilities or raw
+logits [N, C], compute mAP, per-class AP / precision / recall, macro & micro F1 / precision /
+recall, and hamming loss.
 """
 import numpy as np
 from sklearn.metrics import (hamming_loss, average_precision_score, f1_score,
                              precision_score, recall_score)
 
 
-def compute_metrics(targets, probs, threshold=0.5, class_names=None, eval_name="eval"):
+def compute_logit_stats(logits):
+    """Return compact diagnostics for detecting logit explosion/saturation."""
+    logits = np.asarray(logits, dtype=np.float64)
+    finite = np.isfinite(logits)
+    finite_values = logits[finite]
+    stats = {
+        "nonfinite": int((~finite).sum()),
+        "abs_gt_16_ratio": float(np.mean(np.abs(finite_values) > 16.0)) if finite_values.size else 0.0,
+        "abs_gt_80_ratio": float(np.mean(np.abs(finite_values) > 80.0)) if finite_values.size else 0.0,
+    }
+    if finite_values.size:
+        stats.update({
+            "min": float(finite_values.min()),
+            "max": float(finite_values.max()),
+            "mean": float(finite_values.mean()),
+            "std": float(finite_values.std()),
+        })
+    else:
+        stats.update({
+            "min": float("nan"), "max": float("nan"),
+            "mean": float("nan"), "std": float("nan"),
+        })
+    return stats
+
+
+def compute_metrics(targets, probs, threshold=0.5, class_names=None, eval_name="eval",
+                    from_logits=False):
     """
     Args:
         targets:  [N, C] int/float {0,1}
-        probs:    [N, C] float probabilities in [0,1]
+        probs:    [N, C] probabilities in [0,1], or raw logits when
+                  ``from_logits=True``. The historical parameter name is
+                  retained for API compatibility.
         threshold: threshold used to binarise predictions for F1 / precision / recall.
         class_names: optional list of C class names (for per-class reporting keys).
         eval_name: prefix used in the returned dict keys.
+        from_logits: calculate AP directly from raw logits and convert the
+                     probability threshold to its logit decision boundary.
     Returns: dict of metrics.
     """
     targets = np.asarray(targets)
-    probs = np.asarray(probs)
+    scores = np.asarray(probs, dtype=np.float64)
+    if targets.ndim != 2 or scores.ndim != 2 or targets.shape != scores.shape:
+        raise ValueError(
+            f"targets/scores must have the same [N, C] shape; "
+            f"got {targets.shape} and {scores.shape}"
+        )
+    if not np.isfinite(scores).all():
+        raise ValueError("scores contain NaN/Inf; inspect the model logits before evaluation")
     n_classes = targets.shape[1]
     if class_names is None:
         class_names = [f"Class_{i}" for i in range(n_classes)]
 
-    preds = (probs > threshold).astype(int)
+    if from_logits:
+        if not 0.0 < threshold < 1.0:
+            raise ValueError("probability threshold must be strictly between 0 and 1")
+        decision_threshold = float(np.log(threshold) - np.log1p(-threshold))
+    else:
+        decision_threshold = threshold
+    preds = (scores > decision_threshold).astype(int)
 
     # ---------- mAP (mean average precision, ignoring classes with no positives) ----------
     ap_list = []
@@ -41,7 +84,9 @@ def compute_metrics(targets, probs, threshold=0.5, class_names=None, eval_name="
         pos = int(y_true_c.sum())
         per_class_pos.append(pos)
 
-        ap = average_precision_score(y_true_c, probs[:, c]) if pos > 0 else 0.0
+        # AP depends on ranking only. Raw logits preserve that ranking even
+        # when sigmoid would round large scores to identical 0/1 values.
+        ap = average_precision_score(y_true_c, scores[:, c]) if pos > 0 else 0.0
         per_class_ap.append(ap)
         if pos > 0:
             ap_list.append(ap)

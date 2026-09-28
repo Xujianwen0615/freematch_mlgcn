@@ -9,7 +9,6 @@ inp_file: "dataset/custom_muti/custom_glove_word2vec.pkl"
 num_classes: 15
 labeled_ratio: 0.2
 split_mode: "by_prefix"
-test_phase: "test"
 
 backbone: "resnet101"
 variant: "gcn"
@@ -25,13 +24,14 @@ asl_soft_gamma_pos: 0.0
 
 asl_warmup_ratio: 0.03
 
-lambda_u: 1.0
-lambda_e: 0.02
+lambda_u: 1.0     #无标签一致性损失 \(L_{unsup}\) 的权重。
+lambda_e: 0.02    #熵/公平性正则 \(L_{entropy}\) 的总权重。
 T: 0.5
 hard_label: False
 ema_p: 0.999
 ema_m: 0.999
-use_ema_teacher: True
+use_ema_teacher: True  # 是否用EMA模型生成无标签伪标签
+eval_with_ema: True    # 是否用EMA模型验证、测试和选择best.pth
 use_quantile: True
 clip_thresh: True
 

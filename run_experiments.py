@@ -14,11 +14,13 @@ Usage
     python run_experiments.py --out_csv aug_results_summary.csv
 
     # only run a subset
-    python run_experiments.py --only C_ssl_mlgcn_bce,D_ssl_mlgcn --out_csv results_bce_asl_summary.csv
-    python run_experiments.py --only C_ssl_mlgcn_bce,C_ssl_mlgcn_bce_oversample --out_csv results_bce_oversample_summary.csv
-    python run_experiments.py --only C_ssl_mlgcn,C_ssl_mlgcn_q75,C_ssl_mlgcn_q8,C_ssl_mlgcn_q9 --out_csv results_thresh_summary.csv
-    python run_experiments.py --dry
+    python run_experiments.py --only C_ssl_mlgcn,D_ssl_mlgcn --out_csv results_bce_asl_summary.csv
+    python run_experiments.py --only C_ssl_mlgcn,C_ssl_mlgcn_oversample,D_ssl_mlgcn,D_ssl_mlgcn_oversample --out_csv results_oversample_summary.csv
+    python run_experiments.py --only A_sup_mlgcn_bce,C_ssl_mlgcn,H_weak_sup_bce --out_csv bce_results_summary.csv
+    python run_experiments.py --only D_ssl_mlgcn,E_ssl_gap_asl,F_ssl_gmp_asl --out_csv mlgcn_results_summary.csv
+    python run_experiments.py --only B_sup_mlgcn_asl,D_ssl_mlgcn,H_weak_sup_asl --out_csv asl_results_summary.csv
 """
+
 import argparse
 import gc
 import os
@@ -44,38 +46,40 @@ def build_matrix():
     base = {}
     M = {}
     M["A_sup_mlgcn_bce"] = ("Sup-only ML-GCN + BCE                    ", {
-        "labeled_ratio": 1.0, "loss": "bce", "use_class_balancing": False,
+        "epochs": 23, "labeled_ratio": 1.0, "loss": "bce",
         "lambda_u": 0.0, "lambda_e": 0.0, "use_ema_teacher": False,
         "save_name": "A_sup_mlgcn_bce",
     })
     M["B_sup_mlgcn_asl"] = ("Sup-only ML-GCN + ASL                    ", {
-        "epochs": 23, "labeled_ratio": 1.0, "loss": "asl", "lambda_u": 0.0, "lambda_e": 0.0,
-        "use_ema_teacher": False, "save_name": "B_sup_mlgcn_asl",
-    })
-    M["H_weak_sup_asl"] = ("Weak-sup ML-GCN+ASL, only 20% labels     ", {
-        "labeled_ratio": 0.2, "loss": "asl", "lambda_u": 0.0, "lambda_e": 0.0,
-        "use_ema_teacher": False, "save_name": "H_weak_sup_mlgcn_asl_020",
+        "labeled_ratio": 1.0, "loss": "asl",
+        "lambda_u": 0.0, "lambda_e": 0.0, "use_ema_teacher": False,
+        "save_name": "B_sup_mlgcn_asl",
     })
 
     M["C_ssl_mlgcn"] = ("SSL FreeMatch+ML-GCN, BCE loss           ", {
         "loss": "bce", "save_name": "C_ssl_mlgcn",
+    })
+    M["C_ssl_mlgcn_oversample"] = ("SSL FreeMatch+ML-GCN, BCE loss           ", {
+        "loss": "bce", "save_name": "C_ssl_mlgcn_oversample",
         "oversample": True
     })
-    M["C_ssl_mlgcn_q75"] = ("SSL FreeMatch+ML-GCN, BCE loss           ", {
-        "loss": "bce", "save_name": "C_ssl_mlgcn_q75",
-        "oversample": True, "thresh_q": 0.75
-    })
-    M["C_ssl_mlgcn_q8"] = ("SSL FreeMatch+ML-GCN, BCE loss           ", {
-        "loss": "bce", "save_name": "C_ssl_mlgcn_q8",
-        "oversample": True, "thresh_q": 0.80
-    })
-    M["C_ssl_mlgcn_q9"] = ("SSL FreeMatch+ML-GCN, BCE loss           ", {
-        "loss": "bce", "save_name": "C_ssl_mlgcn_q9",
-        "oversample": True, "thresh_q": 0.90
-    })
+
     M["D_ssl_mlgcn"] = ("SSL FreeMatch+ML-GCN, ASL loss (full)    ", {
         "save_name": "D_ssl_mlgcn",
     })
+    M["D_ssl_mlgcn_oversample"] = ("SSL FreeMatch+ML-GCN, ASL loss (full)    ", {
+        "save_name": "D_ssl_mlgcn_oversample",
+        "oversample": True
+    })
+    M["H_weak_sup_asl"] = ("Weak-sup ML-GCN+ASL, only 20% labels     ", {
+        "labeled_ratio": 0.2, "lambda_u": 0.0, "lambda_e": 0.0,
+        "use_ema_teacher": False, "save_name": "H_weak_sup_mlgcn_asl_020",
+    })
+    M["H_weak_sup_bce"] = ("Weak-sup ML-GCN+ASL, only 20% labels     ", {
+        "labeled_ratio": 0.2, "loss": "bce", "lambda_u": 0.0, "lambda_e": 0.0,
+        "use_ema_teacher": False, "save_name": "H_weak_sup_mlgcn_bce_020",
+    })
+
     M["E_ssl_gap_asl"] = ("Ablation: no graph (GAP) + ASL           ", {
         "variant": "gap", "save_name": "E_ssl_gap_asl",
     })

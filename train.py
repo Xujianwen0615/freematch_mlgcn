@@ -130,6 +130,8 @@ def add_argument(parser):
     parser.add_argument("--ema_p", type=float, default=0.999)
     parser.add_argument("--ema_m", type=float, default=0.999)
     parser.add_argument("--use_ema_teacher", type=str2bool, default=True)
+    parser.add_argument("--eval_with_ema", type=str2bool, default=True,
+                        help="evaluate/select checkpoints with EMA weights instead of student weights")
     parser.add_argument("--use_quantile", type=str2bool, default=True)
     parser.add_argument("--clip_thresh", type=str2bool, default=True)
     parser.add_argument("--lambda_u", type=float, default=1.0)
@@ -612,7 +614,8 @@ def train(args):
 
                 # eval + early stopping
                 if it % args.num_eval_iter == 0:
-                    metrics, _, _ = algo.evaluate(val_loader, use_ema=True)
+                    metrics, _, _ = algo.evaluate(
+                        val_loader, use_ema=args.eval_with_ema, eval_name="eval")
                     ap = metrics.get(args.metric, metrics.get("eval/mAP", 0.0))
                     print(format_report(metrics, "eval"))
                     if ap > best_metric:
@@ -642,12 +645,14 @@ def train(args):
             print("[train] loading best model for final eval")
             sd = torch.load(best_path, map_location=device, weights_only=False)
             algo.load_state_dict(sd["algorithm"])
-        metrics, _, _ = algo.evaluate(val_loader, use_ema=True, eval_name="eval")
+        metrics, _, _ = algo.evaluate(
+            val_loader, use_ema=args.eval_with_ema, eval_name="eval")
         print(format_report(metrics, "eval"))
 
         tmetrics = None
         if test_loader is not None:
-            tmetrics, _, _ = algo.evaluate(test_loader, use_ema=True, eval_name="test")
+            tmetrics, _, _ = algo.evaluate(
+                test_loader, use_ema=args.eval_with_ema, eval_name="test")
             print(format_report(tmetrics, "test"))
 
         torch.save({

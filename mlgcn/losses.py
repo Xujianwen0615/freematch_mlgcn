@@ -15,6 +15,7 @@ Reference:
     Alibaba-MIIL/ASL
     https://github.com/Alibaba-MIIL/ASL
 """
+import math
 
 import torch
 import torch.nn as nn
@@ -93,6 +94,11 @@ class AsymmetricLoss(nn.Module):
         logits = logits.float()
         targets = targets.float()
 
+        if not torch.isfinite(logits).all():
+            raise RuntimeError("AsymmetricLoss received NaN/Inf logits.")
+        if not torch.isfinite(targets).all():
+            raise RuntimeError("AsymmetricLoss received NaN/Inf targets.")
+
         # ----------------------------------------------------
         # ASL warmup
         # ----------------------------------------------------
@@ -105,14 +111,11 @@ class AsymmetricLoss(nn.Module):
         # Probability
         # ----------------------------------------------------
 
+        # Keep probabilities only for ASL's focusing weight.  Computing
+        # log(sigmoid(x)) after a probability clamp kills the gradient for
+        # large-magnitude ML-GCN logits, so the log-likelihood itself is
+        # evaluated stably in logit space below.
         xs_pos = torch.sigmoid(logits)
-
-        xs_pos = torch.clamp(
-            xs_pos,
-            min=self.eps,
-            max=1.0 - self.eps
-        )
-
         xs_neg = 1.0 - xs_pos
 
         # ----------------------------------------------------
@@ -124,9 +127,7 @@ class AsymmetricLoss(nn.Module):
         # ----------------------------------------------------
 
         if clip > 0:
-            xs_neg = (
-                xs_neg + clip
-            ).clamp(max=1.0)
+            xs_neg = (xs_neg + clip).clamp(max=1.0)
 
         # ----------------------------------------------------
         # Basic binary cross entropy
@@ -138,15 +139,19 @@ class AsymmetricLoss(nn.Module):
         #     (1-y) log(p_neg)
         # ----------------------------------------------------
 
-        loss_pos = (
-            targets *
-            torch.log(xs_pos.clamp(min=self.eps))
-        )
+        log_pos = F.logsigmoid(logits)
+        if clip > 0:
+            # log(min(1, sigmoid(-x) + clip)) without materialising a
+            # saturated probability before taking the logarithm.
+            log_clip = torch.full_like(logits, math.log(clip))
+            log_neg = torch.logaddexp(
+                F.logsigmoid(-logits), log_clip
+            ).clamp(max=0.0)
+        else:
+            log_neg = F.logsigmoid(-logits)
 
-        loss_neg = (
-            (1.0 - targets) *
-            torch.log(xs_neg.clamp(min=self.eps))
-        )
+        loss_pos = targets * log_pos
+        loss_neg = (1.0 - targets) * log_neg
 
         loss = loss_pos + loss_neg
 
@@ -200,6 +205,15 @@ class AsymmetricLoss(nn.Module):
 
         # official implementation calculates negative log-likelihood
         loss = -loss
+
+        if not torch.isfinite(loss).all():
+            bad = ~torch.isfinite(loss)
+            raise RuntimeError(
+                "NaN/Inf detected in AsymmetricLoss: "
+                f"bad={bad.sum().item()}, "
+                f"logit_min={logits.min().item():.4f}, "
+                f"logit_max={logits.max().item():.4f}"
+            )
 
         # loss shape before reduction:
         #
