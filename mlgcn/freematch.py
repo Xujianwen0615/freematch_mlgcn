@@ -389,7 +389,7 @@ class FreeMatchMultiLabel:
 
     # ------------------------------------------------------------------ eval
     @torch.no_grad()
-    def evaluate(self, loader, use_ema=True, threshold=0.5):
+    def evaluate(self, loader, use_ema=True, threshold=0.5, eval_name="eval"):
         """Compute multi-label metrics over a val/test loader."""
         self.model.eval()
         eval_model = self.ema_model if (use_ema and self.ema_model is not None) else self.model
@@ -408,7 +408,7 @@ class FreeMatchMultiLabel:
         all_probs = 1.0 / (1.0 + np.exp(-all_logits))
 
         metrics = compute_metrics(all_targets, all_probs, threshold=threshold,
-                                  class_names=getattr(self, "class_names", None), eval_name="eval")
+                                  class_names=getattr(self, "class_names", None), eval_name=eval_name)
         self.model.train()
         return metrics, all_logits, all_targets
 

@@ -5,11 +5,12 @@ train.py — unified semi-supervised multi-label training for FreeMatch + ML-GCN
 
 Pipeline
 --------
-  * Load labeled / unlabeled (from the labeled pool with labels hidden) / validation data.
+  * Load labeled / unlabeled (from the labeled pool with labels hidden) / validation / test data.
   * Build an ML-GCN (or plain ResNet baseline) model + GloVe class embeddings.
   * Build the loss (ASL by default, or BCE) + a per-element consistency loss.
   * Wrap everything in FreeMatchMultiLabel (per-class threshold, EMA teacher, entropy reg).
-  * Train with AMP on a single GPU, evaluate validation mAP periodically, and early-stop.
+  * Train with AMP on a single GPU, evaluate validation mAP periodically, early-stop, then test
+    the best checkpoint once.
 
 Usage
 -----
@@ -67,7 +68,7 @@ def add_argument(parser):
     parser.add_argument("--split_mode", type=str, default="by_prefix", choices=["random", "by_prefix"])
     parser.add_argument("--train_phase", type=str, default="train")
     parser.add_argument("--val_phase", type=str, default="val")
-    parser.add_argument("--test_phase", type=str, default=None)
+    parser.add_argument("--test_phase", type=str, default="test")
 
     # model
     parser.add_argument("--backbone", type=str, default="resnet50")
@@ -454,7 +455,8 @@ def train(args):
         global _lb_len
         _lb_len = len(lb_loader)
         print(f"[train] labeled={len(lb_loader.dataset)}, unlabeled={len(ulb_loader.dataset)}, "
-              f"val={len(val_loader.dataset)}")
+              f"val={len(val_loader.dataset)}, "
+              f"test={len(test_loader.dataset) if test_loader is not None else 0}")
 
         # --- model ---
         # Rebuild the label-correlation adjacency from train annotations when requested
@@ -640,11 +642,12 @@ def train(args):
             print("[train] loading best model for final eval")
             sd = torch.load(best_path, map_location=device, weights_only=False)
             algo.load_state_dict(sd["algorithm"])
-        metrics, _, _ = algo.evaluate(val_loader, use_ema=True)
+        metrics, _, _ = algo.evaluate(val_loader, use_ema=True, eval_name="eval")
         print(format_report(metrics, "eval"))
 
+        tmetrics = None
         if test_loader is not None:
-            tmetrics, _, _ = algo.evaluate(test_loader, use_ema=True)
+            tmetrics, _, _ = algo.evaluate(test_loader, use_ema=True, eval_name="test")
             print(format_report(tmetrics, "test"))
 
         torch.save({
@@ -654,6 +657,7 @@ def train(args):
             "args": vars(args),
             "best_metric": best_metric,
             "val_metrics": metrics,
+            "test_metrics": tmetrics,
         }, os.path.join(save_path, "final.pth"))
         print(f"[train] done. best {args.metric}={best_metric:.4f}. saved to {save_path}")
         return metrics, best_metric

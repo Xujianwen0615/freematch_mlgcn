@@ -9,6 +9,7 @@ inp_file: "dataset/custom_muti/custom_glove_word2vec.pkl"
 num_classes: 15
 labeled_ratio: 0.2
 split_mode: "by_prefix"
+test_phase: "test"
 
 backbone: "resnet101"
 variant: "gcn"

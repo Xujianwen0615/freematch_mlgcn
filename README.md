@@ -21,13 +21,16 @@ RTX 3050 Laptop 上做了适配。
 # 1) 安装依赖（建议 Python 3.12 与 CUDA 版 PyTorch）
 pip install -r requirements.txt
 
-# 2) 确认数据集位于 D:\CV\custom_muti（内部需含 data/train、data/val、category.json 等）
+# 2) 确认数据集位于 dataset/custom_muti（含 data/train、data/val、data/test 及对应标注）
 
 # 3) 训练（默认 ResNet-50、ASL、FreeMatch，labeled_ratio=0.2）
-python train.py --c configs/freematch_mlgcn_resnet50.yaml
+python train.py --c configs/freematch_mlgcn.yaml
 
 # 4) 在验证集评估已保存的模型
-python evaluate.py --checkpoint outputs/freematch_mlgcn_resnet50/best.pth --phase val
+python evaluate.py --checkpoint outputs/freematch_mlgcn/best.pth --phase val
+
+# 5) 在独立测试集评估
+python evaluate.py --checkpoint outputs/freematch_mlgcn/best.pth --phase test
 ```
 
 > 若使用更高分辨率（`configs/freematch_mlgcn_resnet50_384.yaml`，384×384）请配合小 batch。
@@ -67,7 +70,7 @@ free_mlgcn/
 
 ## 3. 核心机制（一句话版）
 
-1. **数据**：训练集已全部标注，按 `labeled_ratio` 隐藏部分标签，`有标签`子集用真实标签，其余作为`无标签`子集。
+1. **数据**：实体训练/验证/测试集约按 7:2:1 划分；训练集再按 `labeled_ratio` 隐藏部分标签，其余作为`无标签`子集。
 2. **模型**：ML-GCN 用 ResNet 提取特征，用标签相关性邻接矩阵（`custom_adj.pkl`）+ GloVe 词向量（`custom_glove_word2vec.pkl`）经 GCN 生成分类权重。
 3. **损失**：有标签用 ASL；无标签用"弱增强伪标签 vs 强增强预测"的一致性损失（BCE），并叠加 FreeMatch 熵正则。
 4. **阈值**：每类一个自适应阈值 `thresh[c] = time_p · (p_model[c] / max(p_model))`，由无标签置信度 EMA 自适应更新。

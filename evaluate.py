@@ -73,8 +73,9 @@ def main():
     if saved_args:
         for k in ("num_classes", "backbone", "variant", "gcn_t", "img_size", "data_dir",
                   "embedding", "emb_model"):
-            if hasattr(saved_args, k) and getattr(saved_args, k) is not None:
-                setattr(args, k, getattr(saved_args, k))
+            value = saved_args.get(k) if isinstance(saved_args, dict) else getattr(saved_args, k, None)
+            if value is not None:
+                setattr(args, k, value)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

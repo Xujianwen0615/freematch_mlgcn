@@ -10,9 +10,11 @@ Data layout (D:\\CV\\custom_muti)
     data/
         train/    <image files>
         val/      <image files>
+        test/     <image files>
         category.json      {"class_name": index, ...}   (C classes)
         train_anno.json    [{"file_name": ..., "labels": [indices]}, ...]
         val_anno.json      [{"file_name": ..., "labels": [indices]}, ...]
+        test_anno.json     [{"file_name": ..., "labels": [indices]}, ...]
     custom_adj.pkl                {"P": [C, C]}   label correlation
     custom_glove_word2vec.pkl     [C, 300]        GloVe class embeddings
 
@@ -50,13 +52,18 @@ class MultiLabelDataset(Dataset):
         self.seed = seed
         self.split_mode = split_mode
 
+        if phase not in ("train", "val", "test"):
+            raise ValueError(f"unsupported phase {phase!r}; expected 'train', 'val' or 'test'")
+
         if phase == "train":
             anno_path = os.path.join(data_dir, "data", "train_anno.json")
             assert os.path.exists(anno_path), f"train annotation not found: {anno_path}"
             with open(anno_path, "r", encoding="utf-8") as f:
                 full = json.load(f)
 
-            random.seed(seed)
+            # Use a separate RNG instance so the labeled/unlabeled partition does not depend on
+            # global random state and both dataset objects always receive complementary subsets.
+            rng = random.Random(seed)
 
             if split_mode == "by_prefix":
                 groups = {}
@@ -66,14 +73,15 @@ class MultiLabelDataset(Dataset):
                 lb, ulb = [], []
                 for prefix in sorted(groups.keys()):
                     g = groups[prefix]
-                    random.shuffle(g)
+                    rng.shuffle(g)
                     split_idx = max(1, int(len(g) * labeled_ratio))
                     lb.extend(g[:split_idx])
                     ulb.extend(g[split_idx:])
             else:  # random
-                random.shuffle(full)
-                split_idx = int(len(full) * labeled_ratio)
-                lb, ulb = full[:split_idx], full[split_idx:]
+                shuffled = list(full)
+                rng.shuffle(shuffled)
+                split_idx = int(len(shuffled) * labeled_ratio)
+                lb, ulb = shuffled[:split_idx], shuffled[split_idx:]
 
             self.img_list = ulb if is_unlabeled else lb
             total = len(full)
@@ -173,9 +181,11 @@ if __name__ == "__main__":
     ulb = MultiLabelDataset(a.data_dir, "train", weak_transform=tf, strong_transform=tf,
                             is_unlabeled=True, labeled_ratio=a.ratio, split_mode="by_prefix")
     val = MultiLabelDataset(a.data_dir, "val", weak_transform=tf, is_unlabeled=False, labeled_ratio=1.0)
+    test = MultiLabelDataset(a.data_dir, "test", weak_transform=tf, is_unlabeled=False, labeled_ratio=1.0)
 
     img, tgt = lb[0]
     print("labeled sample:", img.shape, tgt.shape, "pos:", tgt.nonzero()[0].tolist())
     w, s = ulb[0]
     print("unlabeled sample:", w.shape, s.shape)
+    print("eval sets:", "val=", len(val), "test=", len(test))
     print("num_classes:", lb.num_classes, "embeddings:", lb.inp.shape)
