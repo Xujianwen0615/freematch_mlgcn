@@ -77,6 +77,23 @@ use_class_balancing: True
 oversample: False
 # cb_beta: 0.999   # 调 beta（越大越偏向严重/失衡；默认 0.999，可试 0.99 / 0.9999）
 
+# P0-3 稀有类在线扩增（仅用 labeled 子集，默认关闭以保持历史基线）
+rare_aug_method: "none"          # none | cutmix | ulda | cutmix_ulda
+rare_class_ids: []                # [] = 按 labeled 子集计数分位数自动选择
+rare_aug_quantile: 0.25
+rare_aug_prob: 0.50
+
+# CutMix: rare anchor 优先与共享稀有标签的 donor 配对
+rare_aug_pairing: "shared_rare"  # random | shared_rare | label_subset
+cutmix_alpha: 1.0
+cutmix_preserve_rare: True        # anchor 至少保留 50% 面积/损失权重
+
+# ULDA-inspired DSTIM；不是完整的 episodic ULDA/ProtoNet 复现
+ulda_alpha_add: 0.6
+ulda_alpha_sub: 0.8
+ulda_operator: "random"          # random | timadd | timsub
+ulda_pairing: "shared_rare"      # label_subset 最严格，无安全 donor 时跳过
+
 save_dir: "outputs"
 save_name: "freematch_mlgcn"
 seed: 42

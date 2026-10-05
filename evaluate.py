@@ -28,7 +28,7 @@ if sys.platform.startswith("win"):
     except Exception:
         pass
 
-from data import MultiLabelDataset, collate_fn
+from data import MultiLabelDataset, RareClassBatchAugmenter, collate_fn
 from mlgcn import build_model, compute_metrics, format_report
 from mlgcn.metrics import compute_logit_stats
 
@@ -52,6 +52,11 @@ def get_args():
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--img_size", type=int, default=224)
+    p.add_argument("--labeled_ratio", type=float, default=0.2)
+    p.add_argument("--split_mode", type=str, default="by_prefix", choices=["random", "by_prefix"])
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--rare_class_ids", type=str, default="")
+    p.add_argument("--rare_aug_quantile", type=float, default=0.25)
     p.add_argument("--use_ema", type=str2bool, default=True)
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--out_csv", type=str, default="")
@@ -72,8 +77,11 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     saved_args = ckpt.get("args", None)
     if saved_args:
-        for k in ("num_classes", "backbone", "variant", "gcn_t", "img_size", "data_dir",
-                  "embedding", "emb_model"):
+        for k in (
+            "num_classes", "backbone", "variant", "gcn_t", "img_size", "data_dir",
+            "embedding", "emb_model", "labeled_ratio", "split_mode", "seed",
+            "rare_class_ids", "rare_aug_quantile",
+        ):
             value = saved_args.get(k) if isinstance(saved_args, dict) else getattr(saved_args, k, None)
             if value is not None:
                 setattr(args, k, value)
@@ -92,6 +100,21 @@ def main():
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
     class_names = [ds.idx2cat[i] for i in range(ds.num_classes)]
+
+    # Reconstruct the labeled training split so standalone evaluation reports the same
+    # automatically selected tail classes as train.py, without consulting hidden labels.
+    train_lb = MultiLabelDataset(
+        args.data_dir, phase="train", is_unlabeled=False,
+        labeled_ratio=args.labeled_ratio, seed=args.seed, split_mode=args.split_mode,
+    )
+    label_counts = np.zeros(train_lb.num_classes, dtype=np.float32)
+    for item in train_lb.img_list:
+        for class_id in item["labels"]:
+            label_counts[int(class_id)] += 1.0
+    tail_selector = RareClassBatchAugmenter(
+        label_counts, method="none", rare_class_ids=args.rare_class_ids,
+        rare_quantile=args.rare_aug_quantile,
+    )
 
     # Reproduce the same class-embedding source used at training time (GloVe default, or CLIP /
     # random). This keeps the first GCN layer's weight shape consistent with the checkpoint.
@@ -139,6 +162,19 @@ def main():
         all_targets, all_logits, threshold=args.threshold,
         class_names=class_names, eval_name=args.phase, from_logits=True,
     )
+    if tail_selector.rare_class_ids:
+        metrics[f"{args.phase}/tail-mAP"] = float(np.mean([
+            metrics[f"{args.phase}/per_class/{class_names[i]}/AP"]
+            for i in tail_selector.rare_class_ids
+        ]))
+        metrics[f"{args.phase}/tail-recall"] = float(np.mean([
+            metrics[f"{args.phase}/per_class/{class_names[i]}/recall"]
+            for i in tail_selector.rare_class_ids
+        ]))
+        print(
+            "[evaluate] tail classes: "
+            + ", ".join(class_names[i] for i in tail_selector.rare_class_ids)
+        )
     print(format_report(metrics, args.phase))
 
     # CSV report

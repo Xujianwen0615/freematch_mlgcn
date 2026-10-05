@@ -142,6 +142,11 @@ def format_report(metrics, eval_name="eval", top=None):
                  f"{metrics.get(f'{eval_name}/macro-recall', 0.0):.4f}   "
                  f"Micro-P/R: {metrics.get(f'{eval_name}/micro-precision', 0.0):.4f} / "
                  f"{metrics.get(f'{eval_name}/micro-recall', 0.0):.4f}")
+    if f"{eval_name}/tail-mAP" in metrics:
+        lines.append(
+            f"  Tail-mAP={metrics[f'{eval_name}/tail-mAP']:.4f}   "
+            f"Tail-recall={metrics.get(f'{eval_name}/tail-recall', 0.0):.4f}"
+        )
     lines.append(f"{'-'*80}")
     lines.append(f"  {'Class':<28}{'#Pos':>6}{'AP':>9}{'Prec':>9}{'Rec':>9}")
     per_keys = sorted([k for k in metrics if f"{eval_name}/per_class/" in k and k.endswith("/AP")])

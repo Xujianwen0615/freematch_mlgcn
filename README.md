@@ -53,7 +53,8 @@ free_mlgcn/
 │   ├── freematch.py              #   FreeMatch 多标签核心 + EMA teacher
 │   └── metrics.py                #   mAP / macro-micro F1 / hamming
 ├── data/
-│   └── custom_dataset.py         # MultiLabelDataset（含 SSL 标签隐藏）+ collate_fn
+│   ├── custom_dataset.py         # MultiLabelDataset（含 SSL 标签隐藏）+ collate_fn
+│   └── rare_class_augmentation.py # CutMix + ULDA-inspired DSTIM
 ├── configs/                      # 训练配置（YAML）
 │   ├── freematch_mlgcn_resnet50.yaml
 │   ├── freematch_mlgcn_resnet50_384.yaml
@@ -63,7 +64,8 @@ free_mlgcn/
     ├── 02_数据准备与数据加载器.md
     ├── 03_模型与算法集成.md
     ├── 04_训练与验证.md
-    └── 05_消融实验与基准.md
+    ├── 05_消融实验与基准.md
+    └── 09_CutMix与ULDA稀有类扩增.md  # 稀有类在线扩增与消融建议
 ```
 
 ---
@@ -90,14 +92,21 @@ free_mlgcn/
 | D | **完整方法**：FreeMatch + ML-GCN + ASL |
 | E / F | **无图**（GAP）/ **无 GCN 头**（GMP）+ ASL（验证 ML-GCN 的作用） |
 | G_ratio_* | `labeled_ratio` = 0.05 / 0.1 / 0.2 / 0.5（探究无标签数据量收益） |
+| I / J / K / L | 稀有类采样基线 / CutMix / ULDA-inspired DSTIM / 两者混合 |
 
 ```bash
 # 跑全部实验并汇总到 CSV
-python run_experiments.py --base configs/freematch_mlgcn_resnet50.yaml --out_csv results_summary.csv
+python run_experiments.py --base configs/freematch_mlgcn.yaml --out_csv results_summary.csv
 
 # 只跑 A、B、D
-python run_experiments.py --only A,B,D
+python run_experiments.py --only A_sup_mlgcn_bce,B_sup_mlgcn_asl,D_ssl_mlgcn
+
+# 稀有类扩增消融（会额外汇总 Tail-mAP 与 Tail-recall）
+python run_experiments.py --only D_ssl_mlgcn,I_tail_sampler,J_tail_cutmix,K_tail_ulda,L_tail_hybrid --out_csv rare_aug_results.csv
 ```
+
+CutMix 与 ULDA 的适配边界、配置字段及多标签风险见
+[docs/09_CutMix与ULDA稀有类扩增.md](docs/09_CutMix与ULDA稀有类扩增.md)。
 
 ---
 
