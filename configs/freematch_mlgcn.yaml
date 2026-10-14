@@ -2,10 +2,9 @@
 # Main config: FreeMatch + ML-GCN + ASL, ResNet (4GB-friendly)
 # Usage:  python train.py --c configs/freematch_mlgcn.yaml
 # =============================================================================
-data_dir: "dataset/custom_muti"
-# data_dir: "dataset/custom_muti_aug"
-adj_file: "dataset/custom_muti/custom_adj.pkl"
-inp_file: "dataset/custom_muti/custom_glove_word2vec.pkl"
+data_dir: "dataset/custom_multi"
+adj_file: "dataset/custom_multi/custom_adj.pkl"
+inp_file: "dataset/custom_multi/custom_glove_word2vec.pkl"
 num_classes: 15
 labeled_ratio: 0.2
 split_mode: "by_prefix"
@@ -21,29 +20,28 @@ asl_gamma_pos: 0.0
 asl_clip: 0.05
 asl_soft_gamma_neg: 2.0
 asl_soft_gamma_pos: 0.0
-
 asl_warmup_ratio: 0.03
 
 lambda_u: 1.0     #无标签一致性损失 \(L_{unsup}\) 的权重。
-lambda_e: 0.02    #熵/公平性正则 \(L_{entropy}\) 的总权重。
-T: 0.5
-hard_label: False
-ema_p: 0.999
+lambda_e: 0.02    #熵/公平性正则 \(L_{entropy}\) 的权重。
+
 ema_m: 0.999
 use_ema_teacher: True  # 是否用EMA模型生成无标签伪标签
 eval_with_ema: True    # 是否用EMA模型验证、测试和选择best.pth
-use_quantile: True
-clip_thresh: True
-
 
 # ---- P1: relaxed pseudo-label thresholds / consistency weighting / entropy fairness ----
+hard_label: False
+T: 0.5
+ema_p: 0.999              # EMA 动量，默认 0.999
 time_p_init: 0.3          # 初始自适应阈值（越低 → 越多伪标签通过）
+use_quantile: True
 thresh_q: 0.75            # 阈值更新的分位数（原 0.9 → 0.7，放宽）
-thresh_mod_min: 0.15      # per-class 阈值调制的下限（原 0.25 → 0.15）
+thresh_mod_min: 0.15      # 阈值调制因子的下限（原 0.25 → 0.15）
 thresh_lo: 0.15           # 阈值下界（原 0.25 → 0.15）
 thresh_hi: 0.85           # 阈值上界（原 0.90 → 0.85）
+clip_thresh: True
 clip_lo: 0.4              # time_p 的 EMA 裁剪下界（原 0.6 → 0.4）
-clip_hi: 0.90
+clip_hi: 0.90             # time_p 的 EMA 上界
 conf_pow: 2.0             # 无标签一致性损失的置信度软权重指数（0 = 退回二值掩码）
 unsup_class_balance: true # 伪标签的尾部感知重加权（补偿置信度加权对稀有类的抑制）
 fairness_weight: 0.15     # 熵正则公平项权重（原 0.05 → 0.15）
@@ -75,24 +73,10 @@ metric: "eval/mAP"
 use_class_balancing: True
 # P0-2 稀有类过采样
 oversample: False
-# cb_beta: 0.999   # 调 beta（越大越偏向严重/失衡；默认 0.999，可试 0.99 / 0.9999）
 
-# P0-3 稀有类在线扩增（仅用 labeled 子集，默认关闭以保持历史基线）
-rare_aug_method: "none"          # none | cutmix | ulda | cutmix_ulda
-rare_class_ids: []                # [] = 按 labeled 子集计数分位数自动选择
-rare_aug_quantile: 0.25
-rare_aug_prob: 0.50
-
-# CutMix: rare anchor 优先与共享稀有标签的 donor 配对
-rare_aug_pairing: "shared_rare"  # random | shared_rare | label_subset
-cutmix_alpha: 1.0
-cutmix_preserve_rare: True        # anchor 至少保留 50% 面积/损失权重
-
-# ULDA-inspired DSTIM；不是完整的 episodic ULDA/ProtoNet 复现
-ulda_alpha_add: 0.6
-ulda_alpha_sub: 0.8
-ulda_operator: "random"          # random | timadd | timsub
-ulda_pairing: "shared_rare"      # label_subset 最严格，无安全 donor 时跳过
+# 用于验证和测试中的尾类指标；只统计有标签训练子集
+rare_class_ids: []
+rare_class_quantile: 0.25
 
 save_dir: "outputs"
 save_name: "freematch_mlgcn"

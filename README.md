@@ -46,15 +46,17 @@ free_mlgcn/
 ├── requirements.txt
 ├── train.py                      # 统一训练脚本（加载/模型/损失/FreeMatch/验证/早停）
 ├── evaluate.py                   # 统一评估脚本（mAP / F1 等，输出 CSV）
+├── visualize_gradcam.py          # 训练后难分类别筛选与 Grad-CAM 可视化
 ├── run_experiments.py            # 一键跑基准 + 消融矩阵并汇总
 ├── mlgcn/                        # 核心库
 │   ├── models.py                 #   ML-GCN + ResNet GAP/GMP 基线（可配置 backbone）
 │   ├── losses.py                 #   ASL / ASL-Soft / BCE
 │   ├── freematch.py              #   FreeMatch 多标签核心 + EMA teacher
+│   ├── gradcam.py                #   多标签 Grad-CAM 与难例选择工具
 │   └── metrics.py                #   mAP / macro-micro F1 / hamming
 ├── data/
 │   ├── custom_dataset.py         # MultiLabelDataset（含 SSL 标签隐藏）+ collate_fn
-│   └── rare_class_augmentation.py # CutMix + ULDA-inspired DSTIM
+│   └── rare_class_selection.py  # 按原始有标签训练集选择稀有类
 ├── configs/                      # 训练配置（YAML）
 │   ├── freematch_mlgcn_resnet50.yaml
 │   ├── freematch_mlgcn_resnet50_384.yaml
@@ -64,8 +66,7 @@ free_mlgcn/
     ├── 02_数据准备与数据加载器.md
     ├── 03_模型与算法集成.md
     ├── 04_训练与验证.md
-    ├── 05_消融实验与基准.md
-    └── 09_CutMix与ULDA稀有类扩增.md  # 稀有类在线扩增与消融建议
+    └── 05_消融实验与基准.md
 ```
 
 ---
@@ -92,7 +93,7 @@ free_mlgcn/
 | D | **完整方法**：FreeMatch + ML-GCN + ASL |
 | E / F | **无图**（GAP）/ **无 GCN 头**（GMP）+ ASL（验证 ML-GCN 的作用） |
 | G_ratio_* | `labeled_ratio` = 0.05 / 0.1 / 0.2 / 0.5（探究无标签数据量收益） |
-| I / J / K / L | 稀有类采样基线 / CutMix / ULDA-inspired DSTIM / 两者混合 |
+| I | 稀有类采样基线 |
 
 ```bash
 # 跑全部实验并汇总到 CSV
@@ -101,12 +102,9 @@ python run_experiments.py --base configs/freematch_mlgcn.yaml --out_csv results_
 # 只跑 A、B、D
 python run_experiments.py --only A_sup_mlgcn_bce,B_sup_mlgcn_asl,D_ssl_mlgcn
 
-# 稀有类扩增消融（会额外汇总 Tail-mAP 与 Tail-recall）
-python run_experiments.py --only D_ssl_mlgcn,I_tail_sampler,J_tail_cutmix,K_tail_ulda,L_tail_hybrid --out_csv rare_aug_results.csv
+# 稀有类采样基线
+python run_experiments.py --only D_ssl_mlgcn,I_tail_sampler --out_csv tail_sampler_results.csv
 ```
-
-CutMix 与 ULDA 的适配边界、配置字段及多标签风险见
-[docs/09_CutMix与ULDA稀有类扩增.md](docs/09_CutMix与ULDA稀有类扩增.md)。
 
 ---
 
@@ -115,3 +113,30 @@ CutMix 与 ULDA 的适配边界、配置字段及多标签风险见
 - **PyTorch ≥ 2.0、torchvision ≥ 0.15**（图 / 嵌入加载、RandAugment 均依赖）。
 - 图像归一化 mean/std 取私有数据集统计值（`DEFAULT_MEAN/STD`）。
 - 代码在 `mlgcn/` 与 `data/` 中各自独立（`models/losses/freematch` 均不依赖 semilearn 框架），便于单独测试与二次开发。
+
+---
+
+## 6. 难分类别 Grad-CAM
+
+训练完成后，可在验证集上按逐类 AP 自动选择难分类别，并分别输出 TP、FN、FP 与决策边界样本：
+
+```bash
+python visualize_gradcam.py --checkpoint outputs/freematch_mlgcn/best.pth --phase val --top-k 3 --samples-per-group 3
+```
+
+默认解释与模型选择一致的 EMA 权重，并将 Grad-CAM 挂在 ResNet `layer4` 的最后一个
+残差块。小目标可额外运行 `--target-layer layer3` 获取更高空间分辨率。也可用
+`--class-ids 2,9,11` 跳过自动排名，直接解释指定类别。
+
+每次运行会在 checkpoint 同目录创建独立目录
+`gradcam_val/<时间>_layer4/`，避免不同参数生成的图片互相覆盖。传入
+`--output-dir` 时，该目录必须为空。
+
+目录内容包括：
+
+- `class_ranking.csv`：按 AP、Recall 排序的逐类难度表。
+- `samples.csv`：图像路径、完整真值/预测标签、概率、logit、错误类型和热图路径。
+- `run_summary.json`：本次权重、阈值、目标层和选中类别。
+- `class_*/tp|fn|fp|boundary/*.png`：原图、Grad-CAM、叠加图三联图。
+
+自动难类应优先在验证集上选择；测试集只用于最终报告，避免用测试结果反向挑选类别。

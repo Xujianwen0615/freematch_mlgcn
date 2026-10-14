@@ -169,12 +169,12 @@ class FreeMatchMultiLabel:
 
     def _per_class_threshold(self):
         """per_class_thresh[c] = time_p * (p_model[c] / max(p_model)), clamped."""
-        mod = self.p_model / self.p_model.max()
+        mod = self.p_model / self.p_model.max()         # [C]
 
         # 改后（更低阈值 → 更多伪标签通过）
         mod = torch.clamp(mod, self.thresh_mod_min, 1.0)  # 0.25 → 0.15
         thresh = torch.clamp(self.time_p * mod, self.thresh_lo, self.thresh_hi)  # 0.25/0.90 → 0.15/0.85
-        return thresh
+        return thresh           # [C]
 
     @torch.no_grad()
     def _update_threshold(self, probs_ulb):
@@ -212,6 +212,7 @@ class FreeMatchMultiLabel:
         number ``(1-beta)/(1-beta^{n_c})`` (Cui et al., CVPR 2019) gives rare classes a much larger
         weight than the old linear ``1/n`` term capped at 5.0. Weights are mean-normalised and then
         clamped (0.05..20) so no single class dominates a batch.
+        根据有标签数据中每个类别的出现次数，计算每个类别的平衡权重，返回形状为 [C] 的向量。
         """
         counts = self.label_counts.clamp(min=1.0)
         beta = float(self.cb_beta)
@@ -237,7 +238,12 @@ class FreeMatchMultiLabel:
         return per_elem
 
     def _target_weight(self, targets):
-        """Return per-entry effective-number weights for one hard target matrix."""
+        """
+        Return per-entry effective-number weights for one hard target matrix.
+        为每个样本-类别对生成权重，形状 [B, C]
+        只有正类会被类别平衡加权，负类权重始终为 1
+        若不做类别平衡,直接返回全 1 矩阵
+        """
         if not self.use_class_balancing:
             return torch.ones_like(targets)
         with torch.no_grad():
@@ -248,110 +254,28 @@ class FreeMatchMultiLabel:
                 torch.ones((), device=targets.device, dtype=targets.dtype),
             )
 
-    def _sup_loss(self, logits_x_lb, y_lb, y_lb_b=None, mix_lam=None, sup_mask=None):
-        """Supervised ASL/BCE with optional CutMix targets and ignored label entries.
+    def _sup_loss(self, logits_x_lb, y_lb):
+        """Supervised ASL/BCE with optional effective-number class weights."""
+        per_elem = self._loss_matrix(logits_x_lb, y_lb)
+        weight = self._target_weight(y_lb)
+        return (per_elem * weight).sum() / weight.sum().clamp(min=1.0)
 
-        CutMix is evaluated as a weighted sum of two *hard-target* losses instead of
-        passing a soft target into hard-label ASL.  ``sup_mask`` is used by the
-        ULDA-inspired multi-label adaptation to ignore donor-only positives that would
-        otherwise be trained as false negatives.
-        """
-        per_a = self._loss_matrix(logits_x_lb, y_lb)
-        weight_a = self._target_weight(y_lb)
-
-        if y_lb_b is None:
-            if mix_lam is not None:
-                raise ValueError("mix_lam requires y_lb_b.")
-            numerator = per_a * weight_a
-            denominator = weight_a
-        else:
-            if y_lb_b.shape != y_lb.shape:
-                raise ValueError(
-                    f"CutMix target shapes differ: {tuple(y_lb.shape)} vs "
-                    f"{tuple(y_lb_b.shape)}"
-                )
-            if mix_lam is None:
-                raise ValueError("y_lb_b requires mix_lam.")
-            lam = torch.as_tensor(
-                mix_lam, device=logits_x_lb.device, dtype=per_a.dtype
-            )
-            if lam.ndim == 1:
-                lam = lam.unsqueeze(1)
-            if lam.shape != (y_lb.shape[0], 1):
-                raise ValueError(
-                    f"mix_lam must have shape [B] or [B,1], got {tuple(lam.shape)}"
-                )
-            if bool(((lam < 0) | (lam > 1)).any()):
-                raise ValueError("mix_lam values must be in [0, 1].")
-
-            per_b = self._loss_matrix(logits_x_lb, y_lb_b)
-            weight_b = self._target_weight(y_lb_b)
-            numerator = lam * per_a * weight_a + (1.0 - lam) * per_b * weight_b
-            denominator = lam * weight_a + (1.0 - lam) * weight_b
-
-        if sup_mask is not None:
-            mask = torch.as_tensor(
-                sup_mask, device=logits_x_lb.device, dtype=numerator.dtype
-            )
-            if mask.shape != y_lb.shape:
-                raise ValueError(
-                    f"sup_mask must have shape {tuple(y_lb.shape)}, got {tuple(mask.shape)}"
-                )
-            if bool((mask < 0).any()):
-                raise ValueError("sup_mask cannot contain negative values.")
-            numerator = numerator * mask
-            denominator = denominator * mask
-
-        return numerator.sum() / denominator.sum().clamp(min=1.0)
-
-    #     def _sup_loss(self, logits_x_lb, y_lb):
-    #         """Supervised (ASL / BCE) loss with optional class re-balancing. Returns scalar."""
-    #         per_elem = self.criterion(logits_x_lb, y_lb)  # [B, C]
-    #         if self.use_class_balancing:
-    #             with torch.no_grad():
-    #                 class_weight = 1.0 / (self.label_hist.to(y_lb.device) * self.num_classes + 0.1)
-    #                 class_weight = class_weight.clamp(0.5, 5.0)
-
-    #                 # # B) Effective-number (class-balanced) reweighting，β 可调（图省事就用 A）
-    #                 # beta = 0.999
-    #                 # n_c = self.label_hist.to(y_lb.device) * self.num_classes          # 各类有效计数
-    #                 # class_weight = (1.0 - beta) / (1.0 - pow(beta, n_c) + 1e-7)
-    #                 # class_weight = class_weight / class_weight.sum() * self.num_classes  # 归一化回均值
-
-    #                 weight = torch.where(
-    #                     y_lb > 0.5,
-    #                     class_weight.unsqueeze(0),
-    #                     torch.tensor(1.0, device=y_lb.device),
-    #                 )
-    #                 normalizer = weight.sum().clamp(min=1.0)
-    #             return (per_elem * weight).sum() / normalizer
-    #         return per_elem.mean()
-
-    def sup_train_step(self, x_lb, y_lb, y_lb_b=None, mix_lam=None, sup_mask=None):
+    def sup_train_step(self, x_lb, y_lb):
         """Supervised-only step (used for full-supervision baselines / no-unlabeled runs).
         Compatible with:ASL     BCE
         """
         x_lb, y_lb = self._to_device(x_lb, y_lb)
-        y_lb_b = y_lb_b.to(self.device) if y_lb_b is not None else None
-        mix_lam = mix_lam.to(self.device) if mix_lam is not None else None
-        sup_mask = sup_mask.to(self.device) if sup_mask is not None else None
         self.it += 1
-        # if hasattr(self.criterion, "set_progress"):
-        #     progress = min(1.0, self.it / max(1, int(self.num_train_iter * self.asl_warmup_ratio)))
-        #     self.criterion.set_progress(progress)
+
         # ASL warmup; BCE automatically skips
         self._update_loss_schedule()
         with self.amp_cm:
             logits_x_lb = self.model(x_lb)
-            sup_loss = self._sup_loss(
-                logits_x_lb, y_lb, y_lb_b=y_lb_b, mix_lam=mix_lam,
-                sup_mask=sup_mask,
-            )
+            sup_loss = self._sup_loss(logits_x_lb, y_lb)
         return {"sup_loss": sup_loss.item(), "unsup_loss": 0.0,
                 "ent_loss": 0.0, "total_loss": sup_loss.item(), "util_ratio": 0.0}, sup_loss
 
-    def train_step(self, x_lb, y_lb, x_ulb_w, x_ulb_s,
-                   y_lb_b=None, mix_lam=None, sup_mask=None):
+    def train_step(self, x_lb, y_lb, x_ulb_w, x_ulb_s):
         """
         Args:
             x_lb:    [B, 3, H, W] labeled images
@@ -361,15 +285,8 @@ class FreeMatchMultiLabel:
         Returns: dict of scalar losses.
         """
         x_lb, y_lb, x_ulb_w, x_ulb_s = self._to_device(x_lb, y_lb, x_ulb_w, x_ulb_s)
-        y_lb_b = y_lb_b.to(self.device) if y_lb_b is not None else None
-        mix_lam = mix_lam.to(self.device) if mix_lam is not None else None
-        sup_mask = sup_mask.to(self.device) if sup_mask is not None else None
         self.it += 1
 
-        # # ASL warmup: first ``asl_warmup_ratio`` of training behaves like BCE.
-        # if hasattr(self.criterion, "set_progress"):
-        #     progress = min(1.0, self.it / max(1, int(self.num_train_iter * self.asl_warmup_ratio)))
-        #     self.criterion.set_progress(progress)
         # ================================
         # ASL → warmup
         # BCE → no-op
@@ -382,27 +299,21 @@ class FreeMatchMultiLabel:
             logits_x_ulb_s = self.model(x_ulb_s)
 
             # ---- supervised loss (ASL or BCE, with optional class re-balancing) ----
-            sup_loss = self._sup_loss(
-                logits_x_lb, y_lb, y_lb_b=y_lb_b, mix_lam=mix_lam,
-                sup_mask=sup_mask,
-            )
+            sup_loss = self._sup_loss(logits_x_lb, y_lb)
 
             # ---- pseudo-label from the EMA teacher on the weak view ----
             with torch.no_grad():
                 teacher = self.ema_model if self.use_ema_teacher else self.model
-                logits_x_ulb_w = teacher(x_ulb_w)
-                probs_x_ulb_w = torch.sigmoid(logits_x_ulb_w.float())
+                logits_x_ulb_w = teacher(x_ulb_w)                           # [U, C]
+                probs_x_ulb_w = torch.sigmoid(logits_x_ulb_w.float())       # [U, C]
                 self._update_threshold(probs_x_ulb_w)
 
                 thresh = self._per_class_threshold()  # [C]
                 mask = probs_x_ulb_w > thresh.unsqueeze(0)  # [U, C] bool
-                # pos_mask = prob >= tau_pos
-                # neg_mask = prob <= tau_neg
-                # mask = pos_mask | neg_mask
                 if self.use_hard_label:
                     pseudo_label = (probs_x_ulb_w > thresh.unsqueeze(0)).float()
                 else:
-                    pseudo_label = torch.sigmoid(logits_x_ulb_w.float() / self.T)  # sharpened soft labels
+                    pseudo_label = torch.sigmoid(logits_x_ulb_w.float() / self.T)  # [U, C] sharpened soft labels
                     pseudo_label = pseudo_label.clamp(1e-6,1.0 - 1e-6)
                 pseudo_label = pseudo_label.float()
 
@@ -461,7 +372,6 @@ class FreeMatchMultiLabel:
         self.model.eval()
         eval_model = self.ema_model if (use_ema and self.ema_model is not None) else self.model
         eval_model.eval()
-
         all_logits, all_targets = [], []
         for batch in loader:
             x, y = batch
@@ -499,6 +409,9 @@ class FreeMatchMultiLabel:
             ]))
             metrics[f"{eval_name}/tail-recall"] = float(np.mean([
                 metrics[f"{eval_name}/per_class/{names[i]}/recall"] for i in tail_ids
+            ]))
+            metrics[f"{eval_name}/tail-precision"] = float(np.mean([
+                metrics[f"{eval_name}/per_class/{names[i]}/precision"] for i in tail_ids
             ]))
         self.model.train()
         return metrics, all_logits, all_targets

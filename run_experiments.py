@@ -19,7 +19,7 @@ Usage
     python run_experiments.py --only A_sup_mlgcn_bce,C_ssl_mlgcn,H_weak_sup_bce --out_csv bce_results_summary.csv
     python run_experiments.py --only D_ssl_mlgcn,E_ssl_gap_asl,F_ssl_gmp_asl --out_csv mlgcn_results_summary.csv
     python run_experiments.py --only B_sup_mlgcn_asl,D_ssl_mlgcn,H_weak_sup_asl --out_csv asl_results_summary.csv
-    python run_experiments.py --only D_ssl_mlgcn,I_tail_sampler,J_tail_cutmix,K_tail_ulda,L_tail_hybrid --out_csv rare_aug_results.csv
+    python run_experiments.py --only D_ssl_mlgcn,I_tail_sampler --out_csv tail_sampler_results.csv
 """
 
 import argparse
@@ -66,27 +66,16 @@ def build_matrix():
     })
 
     M["D_ssl_mlgcn"] = ("SSL FreeMatch+ML-GCN, ASL loss (full)    ", {
-        "save_name": "D_ssl_mlgcn",
+        "save_name": "D_baseline"
     })
+
     M["I_tail_sampler"] = ("Tail baseline: rare-class sampler             ", {
         "oversample": True,
         "save_name": "I_tail_sampler",
     })
-    M["J_tail_cutmix"] = ("Tail augmentation: sampler + CutMix           ", {
-        "oversample": True, "rare_aug_method": "cutmix",
-        "save_name": "J_tail_cutmix",
-    })
-    M["K_tail_ulda"] = ("Tail augmentation: sampler + ULDA-DSTIM        ", {
-        "oversample": True, "rare_aug_method": "ulda",
-        "save_name": "K_tail_ulda",
-    })
-    M["L_tail_hybrid"] = ("Tail augmentation: sampler + CutMix/DSTIM     ", {
-        "oversample": True, "rare_aug_method": "cutmix_ulda",
-        "save_name": "L_tail_hybrid",
-    })
     M["H_weak_sup_asl"] = ("Weak-sup ML-GCN+ASL, only 20% labels     ", {
         "labeled_ratio": 0.2, "lambda_u": 0.0, "lambda_e": 0.0,
-        "use_ema_teacher": False, "save_name": "H_weak_sup_mlgcn_asl_020",
+        "use_ema_teacher": False, "save_name": "H_weak_sup_mlgcn_asl",
     })
     M["H_weak_sup_bce"] = ("Weak-sup ML-GCN+ASL, only 20% labels     ", {
         "labeled_ratio": 0.2, "loss": "bce", "lambda_u": 0.0, "lambda_e": 0.0,
@@ -133,6 +122,9 @@ def main():
         return
 
     only = set(x.strip() for x in a.only.split(",") if x.strip())
+    unknown = only - set(matrix)
+    if unknown:
+        parser.error(f"unknown or unconfigured experiments: {', '.join(sorted(unknown))}")
     skip = set(x.strip() for x in a.skip.split(",") if x.strip())
     keys = [k for k in matrix if (not only or k in only) and k not in skip]
 
@@ -145,11 +137,11 @@ def main():
         results.append(run_one(a.base, k, d, ov))
 
     # Summary table
-    print("\n" + "=" * 100)
+    print("\n" + "=" * 110)
     print("  RESULTS SUMMARY")
-    print("=" * 100)
+    print("=" * 110)
     hdr = (
-        f"  {'Exp':<18}{'mAP':>9}{'Tail-mAP':>10}{'Tail-R':>9}"
+        f"  {'Exp':<18}{'mAP':>9}{'Tail-mAP':>10}{'Tail-R':>9}{'Tail-P':>9}"
         f"{'Macro-F1':>10}{'Micro-F1':>10}{'Hamming':>9}{'Best-ckpt':>12}"
     )
     print(hdr)
@@ -158,26 +150,31 @@ def main():
         mAP = metrics.get("eval/mAP", 0.0)
         tail_map = metrics.get("eval/tail-mAP", 0.0)
         tail_recall = metrics.get("eval/tail-recall", 0.0)
+        tail_precision = metrics.get("eval/tail-precision", 0.0)
         mf1 = metrics.get("eval/macro-F1", 0.0)
         mif1 = metrics.get("eval/micro-F1", 0.0)
         ham = metrics.get("eval/hamming_loss", 0.0)
-        rows.append((name, mAP, tail_map, tail_recall, mf1, mif1, ham, f"{best:.4f}"))
+        rows.append((
+            name, mAP, tail_map, tail_recall, tail_precision,
+            mf1, mif1, ham, f"{best:.4f}",
+        ))
         print(
             f"  {name:<18}{mAP:>9.4f}{tail_map:>10.4f}{tail_recall:>9.4f}"
+            f"{tail_precision:>9.4f}"
             f"{mf1:>10.4f}{mif1:>10.4f}{ham:>9.4f}{best:>12.4f}"
         )
-    print("=" * 100)
+    print("=" * 110)
 
     if a.out_csv:
         import csv
         with open(a.out_csv, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([
-                "exp", "mAP", "tail_mAP", "tail_recall", "macro_F1",
-                "micro_F1", "hamming", "best_metric",
+                "exp", "mAP", "tail_mAP", "tail_recall", "tail_precision",
+                "macro_F1", "micro_F1", "hamming", "best_metric",
             ])
-            for name, mAP, tail_map, tail_recall, mf1, mif1, ham, best in rows:
-                w.writerow([name, mAP, tail_map, tail_recall, mf1, mif1, ham, best])
+            for row in rows:
+                w.writerow(row)
         print(f"[run_experiments] summary CSV saved to {a.out_csv}")
 
 

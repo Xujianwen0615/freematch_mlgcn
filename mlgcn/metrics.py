@@ -145,7 +145,8 @@ def format_report(metrics, eval_name="eval", top=None):
     if f"{eval_name}/tail-mAP" in metrics:
         lines.append(
             f"  Tail-mAP={metrics[f'{eval_name}/tail-mAP']:.4f}   "
-            f"Tail-recall={metrics.get(f'{eval_name}/tail-recall', 0.0):.4f}"
+            f"Tail-recall={metrics.get(f'{eval_name}/tail-recall', 0.0):.4f}   "
+            f"Tail-precision={metrics.get(f'{eval_name}/tail-precision', 0.0):.4f}"
         )
     lines.append(f"{'-'*80}")
     lines.append(f"  {'Class':<28}{'#Pos':>6}{'AP':>9}{'Prec':>9}{'Rec':>9}")

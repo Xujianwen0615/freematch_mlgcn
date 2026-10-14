@@ -15,7 +15,7 @@ Pipeline
 Usage
 -----
     python train.py --c configs/freematch_mlgcn.yaml
-    python train.py --c configs/freematch_mlgcn.yaml --save_name test_adj
+    python train.py --c configs/freematch_mlgcn.yaml --save_name baseline
 """
 import argparse
 import math
@@ -40,7 +40,7 @@ if sys.platform.startswith("win"):
     except Exception:
         pass
 
-from data import MultiLabelDataset, RareClassBatchAugmenter, collate_fn
+from data import MultiLabelDataset, collate_fn, select_rare_classes
 from mlgcn import build_model, build_loss, FreeMatchMultiLabel
 from mlgcn.metrics import format_report
 
@@ -102,34 +102,12 @@ def add_argument(parser):
     parser.add_argument("--cb_beta", type=float, default=0.999,
                         help="beta for effective-number class balancing (Cui et al., CVPR 2019)")
 
-    # rare-class online augmentation (labeled stream only)
-    parser.add_argument(
-        "--rare_aug_method", type=str, default="none",
-        choices=["none", "cutmix", "ulda", "cutmix_ulda"],
-        help="rare-class augmentation: CutMix, ULDA-inspired DSTIM, or a hybrid",
-    )
+    # Classes used for tail metrics on validation and test sets.
     parser.add_argument(
         "--rare_class_ids", type=str, default="",
         help="comma-separated class ids; empty selects the rare-count quantile automatically",
     )
-    parser.add_argument("--rare_aug_quantile", type=float, default=0.25)
-    parser.add_argument("--rare_aug_prob", type=float, default=0.5)
-    parser.add_argument(
-        "--rare_aug_pairing", type=str, default="shared_rare",
-        choices=["random", "shared_rare", "label_subset"],
-    )
-    parser.add_argument("--cutmix_alpha", type=float, default=1.0)
-    parser.add_argument("--cutmix_preserve_rare", type=str2bool, default=True)
-    parser.add_argument("--ulda_alpha_add", type=float, default=0.6)
-    parser.add_argument("--ulda_alpha_sub", type=float, default=0.8)
-    parser.add_argument(
-        "--ulda_operator", type=str, default="random",
-        choices=["random", "timadd", "timsub"],
-    )
-    parser.add_argument(
-        "--ulda_pairing", type=str, default="shared_rare",
-        choices=["random", "shared_rare", "label_subset"],
-    )
+    parser.add_argument("--rare_class_quantile", type=float, default=0.25)
 
     # ---- P1: pseudo-label thresholds / consistency weighting / entropy fairness ----
     parser.add_argument("--time_p_init", type=float, default=0.3,
@@ -489,35 +467,17 @@ def train(args):
               f"val={len(val_loader.dataset)}, "
               f"test={len(test_loader.dataset) if test_loader is not None else 0}")
 
-        # Rare-class augmentation is intentionally online and restricted to the labeled
-        # stream: using hidden ground-truth labels from the unlabeled split would leak labels.
-        rare_augmenter = RareClassBatchAugmenter(
-            label_counts,
-            method=args.rare_aug_method,
-            rare_class_ids=args.rare_class_ids,
-            rare_quantile=args.rare_aug_quantile,
-            probability=args.rare_aug_prob,
-            pairing=args.rare_aug_pairing,
-            ulda_pairing=args.ulda_pairing,
-            cutmix_alpha=args.cutmix_alpha,
-            cutmix_preserve_anchor=args.cutmix_preserve_rare,
-            ulda_alpha_add=args.ulda_alpha_add,
-            ulda_alpha_sub=args.ulda_alpha_sub,
-            ulda_operator=args.ulda_operator,
-            mean=DEFAULT_MEAN,
-            std=DEFAULT_STD,
+        rare_ids = select_rare_classes(
+            label_counts, args.rare_class_ids, args.rare_class_quantile,
         )
-        selected_rare = rare_augmenter.selected_classes(class_names)
+        selected_rare = [
+            {"id": class_id, "name": class_names[class_id], "count": int(label_counts[class_id])}
+            for class_id in rare_ids
+        ]
         selected_text = ", ".join(
             f"{item['name']}[{item['id']}]={item['count']}" for item in selected_rare
         ) or "none"
-        print(
-            f"[rare-aug] method={rare_augmenter.method} prob={rare_augmenter.probability:.2f} "
-            f"pairing={rare_augmenter.pairing} ulda_pairing={rare_augmenter.ulda_pairing}"
-        )
-        print(f"[rare-aug] selected rare classes: {selected_text}")
-        if rare_augmenter.method == "ulda" or rare_augmenter.method == "cutmix_ulda":
-            print("[rare-aug] ULDA mode is a DSTIM-inspired adaptation, not full episodic ULDA.")
+        print(f"[metrics] tail classes from labeled split: {selected_text}")
 
         # --- model ---
         # Rebuild the label-correlation adjacency from train annotations when requested
@@ -600,7 +560,7 @@ def train(args):
             device=device, use_amp=(args.amp and torch.cuda.is_available()), logger=print,
         )
         algo.class_names = class_names
-        algo.rare_class_ids = list(rare_augmenter.rare_class_ids)
+        algo.rare_class_ids = rare_ids
         algo.num_train_iter = args.num_train_iter or (args.epochs * len(lb_loader))
         print(f"[train] thresh_q={algo.thresh_q}")
 
@@ -637,10 +597,6 @@ def train(args):
                   f"gamma_pos={args.asl_soft_gamma_pos}")
         print("[train] start training")
         has_ulb = len(ulb_loader.dataset) > 0 and args.lambda_u > 0
-        rare_log = {
-            "eligible": 0, "augmented": 0, "cutmix": 0,
-            "timadd": 0, "timsub": 0, "ignored_labels": 0,
-        }
         for epoch in range(start_epoch, args.epochs):
             algo.model.train()
             algo.ema_model.train()
@@ -652,51 +608,33 @@ def train(args):
                 if it >= algo.num_train_iter:
                     break
                 x_lb, y_lb = data_lb
-                y_lb_b = mix_lam = sup_mask = None
-                if rare_augmenter.enabled:
-                    x_lb, y_lb, y_lb_b, mix_lam, sup_mask, aug_stats = rare_augmenter(
-                        x_lb, y_lb
-                    )
-                    for key in rare_log:
-                        rare_log[key] += int(aug_stats[key])
                 if data_ulb is not None:
                     x_u_w, x_u_s = data_ulb
-                    log_dict, loss = algo.train_step(
-                        x_lb, y_lb, x_u_w, x_u_s,
-                        y_lb_b=y_lb_b, mix_lam=mix_lam, sup_mask=sup_mask,
-                    )
+                    log_dict, loss = algo.train_step(x_lb, y_lb, x_u_w, x_u_s)
                 else:
-                    log_dict, loss = algo.sup_train_step(
-                        x_lb, y_lb, y_lb_b=y_lb_b, mix_lam=mix_lam,
-                        sup_mask=sup_mask,
-                    )
+                    log_dict, loss = algo.sup_train_step(x_lb, y_lb)
 
                 opt.zero_grad()
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
                 if args.clip_grad:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+                scale_before_step = scaler.get_scale() if scaler.is_enabled() else None
                 scaler.step(opt)
                 scaler.update()
                 sched.step()
-                algo.update()
+                # GradScaler can skip the student optimizer step on overflow.
+                # Keep the EMA teacher unchanged unless the student actually stepped.
+                if scale_before_step is None or scaler.get_scale() >= scale_before_step:
+                    algo.update()
 
                 it += 1
                 global_step += 1
                 if global_step % args.num_log_iter == 0:
-                    rare_suffix = ""
-                    if rare_augmenter.enabled:
-                        rare_suffix = (
-                            f" | rare elig {rare_log['eligible']} aug {rare_log['augmented']} "
-                            f"cm {rare_log['cutmix']} add {rare_log['timadd']} "
-                            f"sub {rare_log['timsub']} ign {rare_log['ignored_labels']}"
-                        )
                     print(f"[train] epoch {epoch} it {it} "
                           f"| sup {log_dict['sup_loss']:.4f} unsup {log_dict['unsup_loss']:.4f} "
                           f"ent {log_dict['ent_loss']:.4f} util {log_dict['util_ratio']:.3f} "
-                          f"lr {opt.param_groups[0]['lr']:.5f}{rare_suffix}")
-                    for key in rare_log:
-                        rare_log[key] = 0
+                          f"lr {opt.param_groups[0]['lr']:.5f}")
 
                 # eval + early stopping
                 if it % args.num_eval_iter == 0:

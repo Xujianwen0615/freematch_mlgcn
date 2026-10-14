@@ -10,7 +10,7 @@ hamming) and writes a CSV report.
 Usage
 -----
     python evaluate.py --checkpoint outputs/freematch_mlgcn_resnet50/best.pth --phase val
-    python evaluate.py --checkpoint outputs/.../final.pth --phase test --config configs/....yaml
+    python evaluate.py --checkpoint outputs/D_baseline_v2/best.pth --phase test
 """
 import argparse
 import os
@@ -28,7 +28,7 @@ if sys.platform.startswith("win"):
     except Exception:
         pass
 
-from data import MultiLabelDataset, RareClassBatchAugmenter, collate_fn
+from data import MultiLabelDataset, collate_fn, select_rare_classes
 from mlgcn import build_model, compute_metrics, format_report
 from mlgcn.metrics import compute_logit_stats
 
@@ -56,7 +56,7 @@ def get_args():
     p.add_argument("--split_mode", type=str, default="by_prefix", choices=["random", "by_prefix"])
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--rare_class_ids", type=str, default="")
-    p.add_argument("--rare_aug_quantile", type=float, default=0.25)
+    p.add_argument("--rare_class_quantile", type=float, default=0.25)
     p.add_argument("--use_ema", type=str2bool, default=True)
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--out_csv", type=str, default="")
@@ -80,7 +80,7 @@ def main():
         for k in (
             "num_classes", "backbone", "variant", "gcn_t", "img_size", "data_dir",
             "embedding", "emb_model", "labeled_ratio", "split_mode", "seed",
-            "rare_class_ids", "rare_aug_quantile",
+            "rare_class_ids", "rare_class_quantile",
         ):
             value = saved_args.get(k) if isinstance(saved_args, dict) else getattr(saved_args, k, None)
             if value is not None:
@@ -111,10 +111,7 @@ def main():
     for item in train_lb.img_list:
         for class_id in item["labels"]:
             label_counts[int(class_id)] += 1.0
-    tail_selector = RareClassBatchAugmenter(
-        label_counts, method="none", rare_class_ids=args.rare_class_ids,
-        rare_quantile=args.rare_aug_quantile,
-    )
+    tail_ids = select_rare_classes(label_counts, args.rare_class_ids, args.rare_class_quantile)
 
     # Reproduce the same class-embedding source used at training time (GloVe default, or CLIP /
     # random). This keeps the first GCN layer's weight shape consistent with the checkpoint.
@@ -162,18 +159,22 @@ def main():
         all_targets, all_logits, threshold=args.threshold,
         class_names=class_names, eval_name=args.phase, from_logits=True,
     )
-    if tail_selector.rare_class_ids:
+    if tail_ids:
         metrics[f"{args.phase}/tail-mAP"] = float(np.mean([
             metrics[f"{args.phase}/per_class/{class_names[i]}/AP"]
-            for i in tail_selector.rare_class_ids
+            for i in tail_ids
         ]))
         metrics[f"{args.phase}/tail-recall"] = float(np.mean([
             metrics[f"{args.phase}/per_class/{class_names[i]}/recall"]
-            for i in tail_selector.rare_class_ids
+            for i in tail_ids
+        ]))
+        metrics[f"{args.phase}/tail-precision"] = float(np.mean([
+            metrics[f"{args.phase}/per_class/{class_names[i]}/precision"]
+            for i in tail_ids
         ]))
         print(
             "[evaluate] tail classes: "
-            + ", ".join(class_names[i] for i in tail_selector.rare_class_ids)
+            + ", ".join(class_names[i] for i in tail_ids)
         )
     print(format_report(metrics, args.phase))
 
